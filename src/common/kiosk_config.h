@@ -1,0 +1,82 @@
+// Every tunable in one place. Defaults are the RP2040 profile without TLS; the CMake build
+// overrides per target (see CMakeLists.txt) and the host build overrides for tests.
+#pragma once
+#include <stdint.h>
+
+#define KIOSK_FW_VERSION "0.1.0"
+#define KIOSK_PROTOCOL_VERSION 3
+
+// Wire canvas (protocol) and the largest output mode we drive.
+#define CANVAS_W 1280
+#define CANVAS_H 720
+#define OUT_MAX_W 1280
+#define OUT_MAX_H 720
+
+// Fixed point: device coordinates carry 3 fractional bits ("px8").
+#define PX8_SHIFT 3
+#define PX8_ONE (1 << PX8_SHIFT)
+#define PX8_HALF (PX8_ONE / 2)
+#define PX8_MAX (4095 * PX8_ONE)   // stored geometry is int16; clamp to ±4095 px
+
+#ifndef KIOSK_BAND_LINES
+#define KIOSK_BAND_LINES 8          // scanlines rasterised per band (8 bpp band buffer)
+#endif
+#ifndef KIOSK_MAX_OPS
+#define KIOSK_MAX_OPS 1000          // dynamic frame op table
+#endif
+#ifndef KIOSK_ARENA_BYTES
+#define KIOSK_ARENA_BYTES 6144      // strings (text, decoded bitmaps) of the dynamic frame
+#endif
+#ifndef KIOSK_MAX_PAINTS
+#define KIOSK_MAX_PAINTS 128
+#endif
+#ifndef KIOSK_MAX_DEFS
+#define KIOSK_MAX_DEFS 1536         // static geometry definitions per set (ids are base-36 ordinals)
+#endif
+#ifndef KIOSK_SCRATCH_BYTES
+#define KIOSK_SCRATCH_BYTES (28 * 1024)   // union: render scratch | static-decode staging
+#endif
+// Decode-time split of the scratch union: [0, KIOSK_DECODE_RECORDER_BYTES) path command recorder,
+// the rest (>= GEOM_SCRATCH_MIN) for the geometry store's index + record staging.
+#ifndef KIOSK_DECODE_RECORDER_BYTES
+#define KIOSK_DECODE_RECORDER_BYTES (20 * 1024)   // Europe's largest territory records to ~7 KB
+#endif
+// Render-time split: [0, KIOSK_BAND_LINES*OUT_MAX_W) band buffer, then RASTER_SCRATCH_BYTES.
+#ifndef KIOSK_LINEPOOL_BYTES
+#define KIOSK_LINEPOOL_BYTES (84 * 1024)   // largest measured need: 77 KB (Europe board at 720p)
+#endif
+#ifndef KIOSK_MAX_CROSSINGS
+#define KIOSK_MAX_CROSSINGS 128     // polygon edge crossings kept per scanline
+#endif
+#ifndef KIOSK_MAX_URL
+#define KIOSK_MAX_URL 256
+#endif
+#ifndef KIOSK_FONT_BITMAP_MAX
+#define KIOSK_FONT_BITMAP_MAX 26    // px; larger text is rendered from outlines
+#endif
+#ifndef KIOSK_PATH_TOLERANCE
+#define KIOSK_PATH_TOLERANCE 0.2f   // curve flattening tolerance, device pixels
+#endif
+#ifndef KIOSK_GLYPH_MAX_VERTS
+#define KIOSK_GLYPH_MAX_VERTS 768   // flattened outline vertices per glyph
+#endif
+#ifndef KIOSK_MAX_BITMAP_BYTES
+#define KIOSK_MAX_BITMAP_BYTES 2048 // decoded 'b' op payload (QR up to ~120 modules)
+#endif
+#ifndef KIOSK_MAX_STATIC_ID
+#define KIOSK_MAX_STATIC_ID 32
+#endif
+
+// Line pool encoding: each scanline is (index, run-1) byte pairs, runs of 1..256 pixels.
+#define LINE_MAX_BYTES (OUT_MAX_W * 2)
+
+// Flash layout (RP2040 Pico W, 2 MB). Offsets are from the start of flash.
+#ifndef KIOSK_GEOM_FLASH_OFFSET
+#define KIOSK_GEOM_FLASH_OFFSET 0x100000u
+#endif
+#ifndef KIOSK_GEOM_FLASH_SIZE
+#define KIOSK_GEOM_FLASH_SIZE 0xEF000u
+#endif
+#ifndef KIOSK_CONFIG_FLASH_OFFSET
+#define KIOSK_CONFIG_FLASH_OFFSET 0x1FF000u
+#endif

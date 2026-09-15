@@ -1,0 +1,11 @@
+build/
+build-*/
+host/build/
+*.uf2
+*.elf
+*.bin
+!assets/*.bin
+*.dis
+*.map
+.DS_Store
+host/out/
