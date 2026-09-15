@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.13)
+project(fontgen C)
+add_executable(fontgen fontgen.c)
+target_include_directories(fontgen PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../../vendor/stb ${CMAKE_CURRENT_LIST_DIR}/../../src/common)
+target_link_libraries(fontgen m)

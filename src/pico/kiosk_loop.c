@@ -1,0 +1,426 @@
+// The protocol state machine (docs/KIOSK_PROTOCOL.md, "The whole protocol"):
+//
+//   loop forever: GET next_url → 200: draw, remember next_url; 304: keep drawing; sleep next_ms
+//
+// plus the three moments the device has no frame for: no Wi-Fi credentials (provisioning), joining
+// Wi-Fi, and registering. Each of those is drawn from a built-in JSON frame through the normal
+// decoder so there is exactly one rendering path.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "pico/stdlib.h"
+#include "pico/rand.h"
+#include "kiosk_loop.h"
+#include "kiosk_config.h"
+#include "flash_store.h"
+#include "net_wifi.h"
+#include "http_client.h"
+#include "provision.h"
+#include "scanout.h"
+#include "frame.h"
+#include "font.h"
+#include "palette.h"
+#include "geom.h"
+#include "raster.h"
+#include "linepool.h"
+#include "icons.h"
+#include "json.h"
+#include "builtin_frames.h"
+#include "ca_certs.h"
+
+extern linepool_t kiosk_linepool;
+
+#define LONG_POLL_TIMEOUT_MS 45000u    // the server parks a request for 25 s; the protocol says >= 40 s
+#define REGISTER_TIMEOUT_MS 20000u
+#define BACKOFF_MIN_MS 1000u
+#define BACKOFF_MAX_MS 60000u
+#define POLL_FLOOR_MS 250u
+#define OFFLINE_AFTER_FAILURES 2
+
+typedef enum { KS_BOOT, KS_PROVISION, KS_WIFI_WAIT, KS_REGISTER, KS_POLL, KS_HALT } state_t;
+
+static state_t state;
+static frame_t frame;
+static frame_decoder_t decoder;
+static palette_t pal;
+static uint8_t scratch[KIOSK_SCRATCH_BYTES] __attribute__((aligned(8)));
+static uint8_t raster_scratch[RASTER_SCRATCH_BYTES];
+static geom_store_t *geom;
+static const video_mode_info_t *mode;
+
+static char cur_url[KIOSK_MAX_URL];      // the URL to GET next
+static bool request_active;
+static int rsp_status;
+static bool rsp_decoding;                // a 200 body is streaming into the decoder
+static uint32_t next_request_ms;         // earliest time for the next GET
+static uint32_t consecutive_failures;
+static bool frame_valid;                 // frame_t holds a drawable frame (for overlays)
+static bool overlay_offline, overlay_version;
+static char reg_body[600];
+static size_t reg_len;
+static uint32_t stat_decode_ms, stat_render_ms, stat_pool_bytes, stat_frames, stat_errors;
+static char last_error[48];
+
+static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
+
+// ---- URLs ----------------------------------------------------------------------------------------
+
+static void config_url(char *out, size_t cap) {
+    snprintf(out, cap, "%s/v1/config?t=%s", kiosk_config.server_base, kiosk_config.token);
+}
+
+static void register_url(char *out, size_t cap) {
+    snprintf(out, cap, "%s/v1/register?model=pico-w&fw=%s", kiosk_config.server_base, KIOSK_FW_VERSION);
+}
+
+// Copies url without its rev=… query parameter, so two URLs that differ only by revision compare
+// equal (that is the only part that changes on every frame, and flash must not be rewritten for it).
+static void strip_rev(const char *url, char *out, size_t cap) {
+    size_t n = 0;
+    const char *q = strchr(url, '?');
+    for (const char *p = url; *p && n + 1 < cap;) {
+        if (q && p > q && strncmp(p, "rev=", 4) == 0 && (p[-1] == '?' || p[-1] == '&')) {
+            const char *e = p + 4;
+            while (*e && *e != '&') e++;
+            if (*e == '&') e++;                       // drop "rev=…&"
+            else if (n && out[n - 1] == '&') n--;    // drop "&rev=…" at the end
+            else if (n && out[n - 1] == '?') n--;    // "?rev=…" was the whole query
+            p = e;
+            continue;
+        }
+        out[n++] = *p++;
+    }
+    out[n] = 0;
+}
+
+static bool url_has_static(const char *url) {
+    const char *q = strchr(url, '?');
+    if (!q) return false;
+    for (const char *p = q + 1; *p;) {
+        if (strncmp(p, "s=", 2) == 0) return true;
+        while (*p && *p != '&') p++;
+        if (*p == '&') p++;
+    }
+    return false;
+}
+
+// Remembers next_url in flash when its shape changed (endpoint or static id), never per revision.
+static void persist_next_url(const char *url, const char *static_id) {
+    char a[KIOSK_MAX_URL], b[KIOSK_MAX_URL];
+    strip_rev(url, a, sizeof a);
+    strip_rev(kiosk_config.next_url, b, sizeof b);
+    bool same_static = strncmp(kiosk_config.static_id, static_id ? static_id : "", KIOSK_MAX_STATIC_ID) == 0;
+    if (strcmp(a, b) == 0 && same_static) return;
+    strncpy(kiosk_config.next_url, url, KIOSK_MAX_URL - 1);
+    kiosk_config.next_url[KIOSK_MAX_URL - 1] = 0;
+    memset(kiosk_config.static_id, 0, sizeof kiosk_config.static_id);
+    if (static_id) strncpy(kiosk_config.static_id, static_id, KIOSK_MAX_STATIC_ID - 1);
+    config_mark_dirty();
+}
+
+// ---- rendering -----------------------------------------------------------------------------------
+
+typedef struct { uint32_t bytes; } sink_ctx_t;
+
+static void line_sink(void *ctx, uint16_t y, const uint8_t *px, uint16_t width) {
+    sink_ctx_t *s = ctx;
+    uint8_t *p = linepool_alloc(&kiosk_linepool, y, LINE_MAX_BYTES);
+    if (!p) { linepool_commit_dup(&kiosk_linepool, y); return; }
+    uint16_t n = rle_encode_line(px, width, p, LINE_MAX_BYTES);
+    if (!n) { linepool_commit_dup(&kiosk_linepool, y); return; }
+    linepool_commit(&kiosk_linepool, y, p, n);
+    s->bytes += n;
+}
+
+static void render_frame_now(void) {
+    op_t extra[3];
+    uint16_t nextra = 0;
+    if (overlay_offline || overlay_version) {
+        uint8_t dark = palette_add(&pal, 0x101820), ink = palette_add(&pal, 0xf8f4ec), warn = palette_add(&pal, 0xffcc66);
+        if (frame_make_overlay_rect(&extra[nextra], mode->w, mode->h, 1180, 640, 80, 60, 12, dark, 220)) nextra++;
+        if (overlay_offline && frame_make_overlay_icon(&extra[nextra], mode->w, mode->h, 1198, 648, 44, icon_lookup("wifi", 4), ink)) nextra++;
+        else if (overlay_version && frame_make_overlay_icon(&extra[nextra], mode->w, mode->h, 1198, 648, 44, icon_lookup("warning", 7), warn)) nextra++;
+    }
+    scanout_upload_palette(&pal);   // colours the decoder added must be live before their lines are
+    raster_t r;
+    raster_init(&r, scratch, raster_scratch, mode->w, mode->h, &pal);
+    linepool_frame_begin(&kiosk_linepool);
+    sink_ctx_t sc = {0};
+    render_stats_t rs = {0};
+    uint32_t t0 = now_ms();
+    frame_render(&frame, &pal, geom, &r, extra, nextra, line_sink, &sc, &rs);
+    scanout_upload_palette(&pal);   // blends allocated while rendering
+    stat_render_ms = now_ms() - t0;
+    stat_pool_bytes = sc.bytes;
+    stat_frames++;
+}
+
+bool kiosk_show_builtin(int which, const char *arg1, const char *arg2) {
+    static char buf[3072];   // the test pattern, the largest built-in frame, is ~2.5 KB
+    size_t n = builtin_frame_json((builtin_frame_t)which, buf, sizeof buf, arg1, arg2);
+    if (!n) return false;
+    frame_decoder_init(&decoder, &frame, &pal, geom, scratch, sizeof scratch, mode->w, mode->h);
+    frame_decoder_feed(&decoder, buf, n);
+    if (frame_decoder_finish(&decoder) != FD_OK) { frame_valid = false; return false; }
+    frame_valid = true;
+    render_frame_now();
+    return true;
+}
+
+// ---- HTTP: registration ----------------------------------------------------------------------
+
+typedef struct { char token[27]; char id[7]; char next_url[KIOSK_MAX_URL]; uint8_t which; size_t len; } reg_parse_t;
+
+static bool reg_cb(void *ctx, const json_stream_t *js, json_event_t ev, const char *data, size_t len, bool final) {
+    reg_parse_t *r = ctx;
+    if (js->depth != 1 || ev != JSON_EV_STRING) return true;
+    char *dst; size_t cap;
+    if (!strcmp(js->key[0], "token")) { dst = r->token; cap = sizeof r->token; }
+    else if (!strcmp(js->key[0], "id")) { dst = r->id; cap = sizeof r->id; }
+    else if (!strcmp(js->key[0], "next_url")) { dst = r->next_url; cap = sizeof r->next_url; }
+    else return true;
+    if (js->index[0] != r->which) { r->which = (uint8_t)js->index[0]; r->len = 0; }   // new string value
+    size_t room = cap - 1 - r->len;
+    if (len > room) len = room;
+    memcpy(dst + r->len, data, len);
+    r->len += len;
+    dst[r->len] = 0;
+    (void)final;
+    return true;
+}
+
+static void reg_on_status(void *ctx, int status) { (void)ctx; rsp_status = status; reg_len = 0; }
+static bool reg_on_body(void *ctx, const uint8_t *data, size_t len) {
+    (void)ctx;
+    if (rsp_status != 200) return true;
+    size_t room = sizeof reg_body - 1 - reg_len;
+    if (len > room) len = room;
+    memcpy(reg_body + reg_len, data, len);
+    reg_len += len;
+    return true;
+}
+
+static void enter_backoff(const char *why) {
+    consecutive_failures++;
+    stat_errors++;
+    strncpy(last_error, why, sizeof last_error - 1);
+    uint32_t cap = BACKOFF_MIN_MS << (consecutive_failures > 6 ? 6 : consecutive_failures - 1);
+    if (cap > BACKOFF_MAX_MS) cap = BACKOFF_MAX_MS;
+    uint32_t delay = get_rand_32() % (cap + 1);            // full jitter
+    if (delay < BACKOFF_MIN_MS / 2) delay = BACKOFF_MIN_MS / 2;
+    next_request_ms = now_ms() + delay;
+    printf("kiosk: %s; retry in %lu ms (failure %lu)\n", why, (unsigned long)delay, (unsigned long)consecutive_failures);
+    if (consecutive_failures >= OFFLINE_AFTER_FAILURES && !overlay_offline && frame_valid) {
+        overlay_offline = true;
+        render_frame_now();
+    }
+}
+
+static void reg_on_complete(void *ctx, int err, int status) {
+    (void)ctx;
+    request_active = false;
+    if (err != HTTP_OK || status != 200) { enter_backoff(err == HTTP_OK ? "register: bad status" : "register failed"); return; }
+    reg_parse_t r;
+    memset(&r, 0, sizeof r);
+    r.which = 0xff;
+    json_stream_t js;
+    json_stream_init(&js, reg_cb, &r);
+    bool ok = json_stream_feed(&js, reg_body, reg_len) && json_stream_finish(&js);
+    if (!ok || strlen(r.token) != 26) { enter_backoff("register: bad body"); return; }
+    memcpy(kiosk_config.token, r.token, sizeof kiosk_config.token);
+    memcpy(kiosk_config.device_id, r.id, sizeof kiosk_config.device_id);
+    kiosk_config.next_url[0] = 0;
+    kiosk_config.static_id[0] = 0;
+    config_save();
+    printf("kiosk: registered as %s\n", kiosk_config.device_id);
+    consecutive_failures = 0;
+    if (r.next_url[0]) strncpy(cur_url, r.next_url, sizeof cur_url - 1); else config_url(cur_url, sizeof cur_url);
+    next_request_ms = now_ms();
+    state = KS_POLL;
+}
+
+// ---- HTTP: frames ----------------------------------------------------------------------------
+
+static void frame_on_status(void *ctx, int status) {
+    (void)ctx;
+    rsp_status = status;
+    rsp_decoding = status == 200;
+    if (rsp_decoding) {
+        frame_decoder_init(&decoder, &frame, &pal, geom, scratch, sizeof scratch, mode->w, mode->h);
+        frame_valid = false;   // frame_t is being overwritten; the pool keeps the last picture
+    }
+}
+
+static bool frame_on_body(void *ctx, const uint8_t *data, size_t len) {
+    (void)ctx;
+    if (!rsp_decoding) return true;   // 304/404 bodies (if any) are irrelevant
+    if (!frame_decoder_feed(&decoder, (const char *)data, len)) { rsp_decoding = false; return false; }
+    return true;
+}
+
+static void frame_on_complete(void *ctx, int err, int status) {
+    (void)ctx;
+    request_active = false;
+    uint32_t now = now_ms();
+    if (err != HTTP_OK) {
+        if (rsp_decoding) { frame_decoder_finish(&decoder); rsp_decoding = false; }
+        enter_backoff(err == HTTP_ERR_TIMEOUT ? "poll timed out" : err == HTTP_ERR_URL ? "bad url" : "poll failed");
+        if (err == HTTP_ERR_URL) { config_url(cur_url, sizeof cur_url); if (strncmp(cur_url, "https:", 6) == 0) kiosk_show_builtin(BUILTIN_NO_TLS, cur_url, NULL); }
+        return;
+    }
+    consecutive_failures = 0;
+    if (overlay_offline) overlay_offline = false;
+    if (status == 304) { next_request_ms = now + POLL_FLOOR_MS; return; }
+    if (status == 404) { config_url(cur_url, sizeof cur_url); next_request_ms = now + POLL_FLOOR_MS; return; }
+    if (status != 200) { enter_backoff("unexpected status"); return; }
+
+    uint32_t t0 = now_ms();
+    frame_status_t st = rsp_decoding ? frame_decoder_finish(&decoder) : FD_ERR_JSON;
+    rsp_decoding = false;
+    stat_decode_ms = now_ms() - t0;
+    switch (st) {
+    case FD_OK:
+        frame_valid = true;
+        overlay_version = false;
+        render_frame_now();
+        if (frame.next_url[0]) strncpy(cur_url, frame.next_url, sizeof cur_url - 1); else config_url(cur_url, sizeof cur_url);
+        cur_url[sizeof cur_url - 1] = 0;
+        persist_next_url(cur_url, frame.static_id[0] ? frame.static_id : NULL);
+        next_request_ms = now + (frame.next_ms > POLL_FLOOR_MS ? POLL_FLOOR_MS : POLL_FLOOR_MS);   // a request is free; next_ms is only a failsafe
+        break;
+    case FD_ERR_STATIC_MISSING:
+        // The server assumed we cached a set we do not have: /config always restores it.
+        config_url(cur_url, sizeof cur_url);
+        next_request_ms = now + POLL_FLOOR_MS;
+        printf("kiosk: static set %s missing, restarting from /config\n", frame.static_id);
+        break;
+    case FD_ERR_VERSION:
+        overlay_version = true;
+        enter_backoff("unsupported frame version");
+        break;
+    default:
+        enter_backoff(st == FD_ERR_STATIC_STORE ? "static store failed" : "bad frame");
+        break;
+    }
+}
+
+static const http_sink_t reg_sink = { reg_on_status, NULL, reg_on_body, reg_on_complete };
+static const http_sink_t frame_sink = { frame_on_status, NULL, frame_on_body, frame_on_complete };
+
+// ---- state machine ---------------------------------------------------------------------------
+
+static void start_poll_state(void) {
+    // Resume where we were if the persisted URL is usable: a URL that names a static set needs
+    // that set to still be in flash.
+    if (kiosk_config.next_url[0] && (!url_has_static(kiosk_config.next_url) || geom_store_is_open(geom)))
+        strncpy(cur_url, kiosk_config.next_url, sizeof cur_url - 1);
+    else
+        config_url(cur_url, sizeof cur_url);
+    cur_url[sizeof cur_url - 1] = 0;
+    next_request_ms = now_ms();
+    state = KS_POLL;
+}
+
+void kiosk_loop_init(void) {
+    mode = video_mode_info((video_mode_t)kiosk_config.video_mode);
+    palette_init(&pal);
+    font_init(font_blob, font_blob_size);
+    geom = geom_flash_get();
+    if (kiosk_config.static_id[0]) {
+        if (geom_store_open(geom, kiosk_config.static_id)) printf("kiosk: static set %s restored from flash\n", kiosk_config.static_id);
+    }
+    http_client_init(http_client_get(), ca_certs_pem, CA_CERTS_PEM_LEN);
+    state = KS_BOOT;
+}
+
+void kiosk_loop_restart(void) {
+    http_cancel(http_client_get());
+    request_active = false;
+    rsp_decoding = false;
+    consecutive_failures = 0;
+    overlay_offline = overlay_version = false;
+    if (provision_active()) provision_stop();
+    state = KS_BOOT;
+}
+
+void kiosk_loop_poll(void) {
+    uint32_t now = now_ms();
+    switch (state) {
+    case KS_BOOT:
+        if (!kiosk_config.wifi_ssid[0]) { provision_start(); state = KS_PROVISION; return; }
+        kiosk_show_builtin(BUILTIN_CONNECTING, kiosk_config.wifi_ssid, NULL);
+        net_wifi_connect(kiosk_config.wifi_ssid, kiosk_config.wifi_pass);
+        state = KS_WIFI_WAIT;
+        return;
+    case KS_PROVISION:
+        return;   // the portal or console will restart us
+    case KS_WIFI_WAIT:
+        if (net_wifi_state() != WIFI_UP) return;
+        net_wifi_led(true);
+        if (!kiosk_config.token[0]) {
+            kiosk_show_builtin(BUILTIN_REGISTERING, NULL, NULL);
+            state = KS_REGISTER;
+            next_request_ms = now;
+        } else {
+            start_poll_state();
+        }
+        return;
+    case KS_REGISTER:
+        if (net_wifi_state() != WIFI_UP) { http_cancel(http_client_get()); request_active = false; state = KS_WIFI_WAIT; return; }
+        if (request_active || (int32_t)(now - next_request_ms) < 0) return;
+        {
+            char url[KIOSK_MAX_URL];
+            register_url(url, sizeof url);
+            int rc = http_get(http_client_get(), url, &reg_sink, NULL, REGISTER_TIMEOUT_MS);
+            if (rc == HTTP_OK) request_active = true;
+            else if (rc == HTTP_ERR_URL) { kiosk_show_builtin(BUILTIN_NO_TLS, url, NULL); state = KS_HALT; }
+            else enter_backoff("register: cannot start");
+        }
+        return;
+    case KS_POLL:
+        if (net_wifi_state() != WIFI_UP) {
+            if (request_active) { http_cancel(http_client_get()); request_active = false; rsp_decoding = false; }
+            net_wifi_led(false);
+            state = KS_WIFI_WAIT;
+            return;
+        }
+        if (request_active || (int32_t)(now - next_request_ms) < 0) return;
+        {
+            int rc = http_get(http_client_get(), cur_url, &frame_sink, NULL, LONG_POLL_TIMEOUT_MS);
+            if (rc == HTTP_OK) request_active = true;
+            else if (rc == HTTP_ERR_URL) {
+                // https without TLS support, or a URL we cannot parse: fall back to the config
+                // endpoint once, then halt on a screen that says what is wrong.
+                char cfg[KIOSK_MAX_URL];
+                config_url(cfg, sizeof cfg);
+                if (strcmp(cfg, cur_url) != 0) { strcpy(cur_url, cfg); enter_backoff("bad next_url"); }
+                else { kiosk_show_builtin(BUILTIN_NO_TLS, cur_url, NULL); state = KS_HALT; }
+            } else enter_backoff("cannot start request");
+        }
+        return;
+    case KS_HALT:
+        return;
+    }
+}
+
+void kiosk_loop_status(char *buf, size_t cap) {
+    static const char *names[] = { "boot", "provision", "wifi-wait", "register", "poll", "halt" };
+    char masked[KIOSK_MAX_URL];
+    // Never print the token: mask everything after "t=" or "/frame/" up to the next delimiter.
+    strncpy(masked, cur_url, sizeof masked - 1); masked[sizeof masked - 1] = 0;
+    for (char *p = masked; *p; p++) {
+        if ((p[0] == 't' && p[1] == '=' && (p == masked || p[-1] == '?' || p[-1] == '&')) || strncmp(p, "/frame/", 7) == 0) {
+            p += p[0] == 't' ? 2 : 7;
+            while (*p && *p != '&' && *p != '?' && *p != '/') *p++ = '*';
+            p--;
+        }
+    }
+    snprintf(buf, cap,
+             "state=%s url=%s active=%d failures=%lu last_error=%s\n"
+             "frames=%lu decode_ms=%lu render_ms=%lu pool_bytes=%lu palette=%u static=%s\n"
+             "video=%s late_lines=%lu vframes=%lu max_line_cycles=%lu",
+             names[state], masked, request_active, (unsigned long)consecutive_failures, last_error[0] ? last_error : "-",
+             (unsigned long)stat_frames, (unsigned long)stat_decode_ms, (unsigned long)stat_render_ms, (unsigned long)stat_pool_bytes,
+             pal.count, geom_store_is_open(geom) ? geom_store_id(geom) : "-",
+             mode ? mode->name : "?", (unsigned long)scanout_late_lines(), (unsigned long)scanout_frames(), (unsigned long)scanout_max_line_cycles());
+}
