@@ -117,6 +117,26 @@ const struct dvi_timing __dvi_const(dvi_timing_960x540p_60hz) = {
 	.bit_clk_khz       = 372000
 };
 
+// 1066x600 (5/6 of 720p, so the 1280x720 canvas fills it) at ~50 Hz. Blanking is trimmed to 120 px so
+// the ~368 MHz clock that already runs 960x540 gives 31 kHz / 50 Hz: inside monitors that need at
+// least 30 kHz and 48 Hz, which PicoDVI's 22 kHz / 30 Hz 720p is not. The kiosk picks the exact
+// clock per Wi-Fi channel (board.c); bit_clk_khz is the channel-1 value.
+const struct dvi_timing __dvi_const(dvi_timing_1066x600p_50hz) = {
+	.h_sync_polarity   = true,
+	.h_front_porch     = 16,
+	.h_sync_width      = 32,
+	.h_back_porch      = 72,
+	.h_active_pixels   = 1066,
+
+	.v_sync_polarity   = true,
+	.v_front_porch     = 3,
+	.v_sync_width      = 5,
+	.v_back_porch      = 13,
+	.v_active_lines    = 600,
+
+	.bit_clk_khz       = 368000
+};
+
 // Note this is NOT the correct 720p30 CEA mode, but rather 720p60 run at half
 // pixel clock. Seems to be commonly accepted (and is a valid CVT mode). The
 // actual CEA mode is the same pixel clock as 720p60 but with >50% blanking,

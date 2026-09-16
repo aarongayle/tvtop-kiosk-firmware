@@ -4,12 +4,18 @@
 #include "tmds.h"
 #include <string.h>
 
-void palette_reset(palette_t *p) { memset(p, 0, sizeof *p); }
+static uint16_t g_generation;
+
+void palette_reset(palette_t *p) {
+    memset(p, 0, sizeof *p);
+    p->generation = ++g_generation;
+}
 void palette_init(palette_t *p) { palette_reset(p); }
 
-uint8_t palette_quantize_component(uint8_t v) { return tmds_nearest_balanced(v); }
+uint8_t palette_quantize_component(uint8_t v) { return KIOSK_FULL_COLOUR ? v : tmds_nearest_balanced(v); }
 
 uint32_t palette_quantize_rgb(uint32_t rgb) {
+    if (KIOSK_FULL_COLOUR) return rgb & 0xffffffu;   // HSTX TMDS-encodes any value: nothing to round
     return ((uint32_t)tmds_nearest_balanced((uint8_t)(rgb >> 16)) << 16) |
            ((uint32_t)tmds_nearest_balanced((uint8_t)(rgb >> 8)) << 8) |
            tmds_nearest_balanced((uint8_t)rgb);
@@ -25,12 +31,102 @@ int palette_find(const palette_t *p, uint32_t rgb) {
     return find_exact(p, palette_quantize_rgb(rgb & 0xffffffu));
 }
 
+// Two sources count as the same colour when no channel differs by more than this.
+#define SAME_COLOUR 10
+
+static bool close_colours(uint32_t a, uint32_t b) {
+    for (int shift = 0; shift <= 16; shift += 8) {
+        int d = (int)((a >> shift) & 0xff) - (int)((b >> shift) & 0xff);
+        if (d > SAME_COLOUR || d < -SAME_COLOUR) return false;
+    }
+    return true;
+}
+
+// The balanced level next to `level`, one step towards `target`; `level` itself at either end.
+static uint8_t step_level(uint8_t level, uint8_t target) {
+    for (int k = 0; k < TMDS_BALANCED_COUNT; k++) {
+        if (tmds_balanced_levels[k] != level) continue;
+        if (target < level && k > 0) return tmds_balanced_levels[k - 1];
+        if (target > level && k + 1 < TMDS_BALANCED_COUNT) return tmds_balanced_levels[k + 1];
+        return level;
+    }
+    return level;
+}
+
+// The balanced levels are sparse near white (EE, EF, then nothing up to FF), so distinct light
+// colours such as white #FFFFFF and a cream panel #F8F4EC quantise to the same entry and the panel
+// vanishes. When a clearly different colour lands on an existing entry, move its most different
+// channel one level towards its own value, so it stays visibly distinct (cream becomes #EFEFDD).
+// Above 0xDD the only balanced levels are 0xEE and 0xEF, so every light colour lands on what looks
+// like white: a cream panel (#F8F4EC) on a white page disappears. Whatever order colours arrive
+// in, a colour whose quantised value is white-looking but whose source is clearly not white steps
+// down one level: its lowest channel, or all three for a neutral grey so it gains no tint.
+// Cream becomes #EFEFDD and #F2F2F2 becomes #DDDDDD; white itself is unchanged.
+#define NEAR_WHITE_SOURCE 0xF5   // every channel at least this counts as white
+static uint32_t separate_from_white(uint32_t rgb, uint32_t q) {
+    int lo = 255, hi = 0, lo_shift = 0;
+    for (int shift = 0; shift <= 16; shift += 8) {
+        int qc = (int)((q >> shift) & 0xff), sc = (int)((rgb >> shift) & 0xff);
+        if (qc < 0xEE) return q;                       // not white-looking
+        if (sc < lo) { lo = sc; lo_shift = shift; }
+        if (sc > hi) hi = sc;
+    }
+    if (lo >= NEAR_WHITE_SOURCE) return q;               // it is white
+    bool neutral = hi - lo <= 6;
+    for (int shift = 0; shift <= 16; shift += 8) {
+        if (!neutral && shift != lo_shift) continue;
+        uint8_t level = (uint8_t)(q >> shift);
+        uint8_t moved = step_level(level, 0);
+        while (moved >= 0xEE && moved != step_level(moved, 0)) moved = step_level(moved, 0);   // EF -> EE -> DD
+        q = (q & ~(0xffu << shift)) | ((uint32_t)moved << shift);
+    }
+    return q;
+}
+
+static uint32_t distinct_quantised(const palette_t *p, uint32_t rgb, uint32_t q, int *found) {
+    if (KIOSK_FULL_COLOUR) { *found = find_exact(p, q); return q; }   // exact colours never collide
+    q = separate_from_white(rgb, q);
+    *found = find_exact(p, q);
+    if (*found >= 0 && close_colours(p->src[*found], rgb)) return q;
+    // A conflict is any entry that looks the same on screen (every quantised channel within 2) but
+    // was added for a clearly different colour. Exact matches are only the obvious case: white is
+    // #EFEFEF and cream #EFEFEE, which no one can tell apart.
+    int conflict = -1;
+    for (uint16_t k = 0; k < p->count; k++) {
+        uint32_t e = p->rgb[k];
+        bool looks_same = true;
+        for (int shift = 0; shift <= 16 && looks_same; shift += 8) {
+            int d = (int)((e >> shift) & 0xff) - (int)((q >> shift) & 0xff);
+            if (d > 2 || d < -2) looks_same = false;
+        }
+        if (looks_same && !close_colours(p->src[k], rgb)) { conflict = k; break; }
+    }
+    if (conflict < 0) return q;
+    uint32_t other = p->src[conflict];
+    int best_shift = 0, best_d = -1;
+    for (int shift = 0; shift <= 16; shift += 8) {
+        int d = (int)((rgb >> shift) & 0xff) - (int)((other >> shift) & 0xff);
+        if (d < 0) d = -d;
+        if (d > best_d) { best_d = d; best_shift = shift; }
+    }
+    uint8_t level = (uint8_t)(q >> best_shift);
+    uint8_t mine = (uint8_t)(rgb >> best_shift), theirs = (uint8_t)(other >> best_shift);
+    // Step away from the other colour's side: a colour darker than its neighbour goes down a level.
+    uint8_t moved = step_level(level, mine < theirs ? 0 : 255);
+    if (moved == level) return q;
+    uint32_t q2 = (q & ~(0xffu << best_shift)) | ((uint32_t)moved << best_shift);
+    *found = find_exact(p, q2);
+    return q2;
+}
+
 uint8_t palette_add(palette_t *p, uint32_t rgb) {
-    uint32_t q = palette_quantize_rgb(rgb & 0xffffffu);
-    int i = find_exact(p, q);
+    rgb &= 0xffffffu;
+    int i;
+    uint32_t q = distinct_quantised(p, rgb, palette_quantize_rgb(rgb), &i);
     if (i >= 0) return (uint8_t)i;
     if (p->count < PALETTE_SIZE) {
         p->rgb[p->count] = q;
+        p->src[p->count] = rgb;
         return (uint8_t)p->count++;
     }
     // Full: nearest existing colour by squared RGB distance. Rare (the decoder resets the palette

@@ -19,6 +19,8 @@ typedef struct {
     struct { uint8_t bg, fg, level, idx; } blend[PALETTE_BLEND_CACHE];
     uint8_t blend_count, blend_next;
     uint32_t stats_overflow;        // colours mapped to a nearest neighbour because the palette was full
+    uint32_t src[PALETTE_SIZE];     // the colour each entry was first added for, before quantising
+    uint16_t generation;            // changes on every reset: indices from before now mean other colours
 } palette_t;
 
 void palette_init(palette_t *p);

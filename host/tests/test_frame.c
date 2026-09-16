@@ -21,6 +21,11 @@ static uint8_t g_rscratch[RASTER_SCRATCH_BYTES];
 static uint8_t g_img[OUT_MAX_W * OUT_MAX_H];
 static uint16_t g_seen[OUT_MAX_H];
 
+// The pixel probes below are written for the 1280x720 canvas at scale 1. The host build's OUT_MAX
+// is larger (it covers the Pico 2 W's 1080p), so decode at a fixed size rather than the maximum.
+#define TEST_W 1280
+#define TEST_H 720
+
 typedef struct { uint32_t ops, defs, paints; bool has_static; } counts_t;
 
 static bool count_cb(void *ctx, const json_stream_t *js, json_event_t ev, const char *data, size_t len, bool final) {
@@ -92,7 +97,7 @@ int main(void) {
         json_stream_init(&js, count_cb, &c);
         CHECK(json_stream_feed(&js, text, len) && json_stream_finish(&js));
 
-        frame_status_t st = decode_chunked(text, len, geom, 7, OUT_MAX_W, OUT_MAX_H);
+        frame_status_t st = decode_chunked(text, len, geom, 7, TEST_W, TEST_H);
         CHECK_MSG(st == FD_OK, "%s: status %d", names[i], (int)st);
         CHECK_MSG(g_frame.stats_dropped_ops == 0, "%s: dropped %u ops", names[i], g_frame.stats_dropped_ops);
         CHECK_MSG(g_frame.nops == c.ops, "%s: nops %u vs json %u", names[i], g_frame.nops, c.ops);
@@ -107,7 +112,7 @@ int main(void) {
         static op_t first[KIOSK_MAX_OPS];
         uint16_t nfirst = g_frame.nops;
         memcpy(first, g_frame.ops, (size_t)nfirst * sizeof(op_t));
-        st = decode_chunked(text, len, geom, 1460, OUT_MAX_W, OUT_MAX_H);
+        st = decode_chunked(text, len, geom, 1460, TEST_W, TEST_H);
         CHECK(st == FD_OK && g_frame.nops == nfirst && memcmp(first, g_frame.ops, (size_t)nfirst * sizeof(op_t)) == 0);
 
         if (!strcmp(names[i], "pairing.json")) {
@@ -163,15 +168,15 @@ int main(void) {
     {
         size_t len; char *text = read_file("test/fixtures/gc-us.json", &len);
         for (size_t cut = 1; cut < len; cut += len / 37) {
-            frame_status_t st = decode_chunked(text, cut, geom, 1000, OUT_MAX_W, OUT_MAX_H);
+            frame_status_t st = decode_chunked(text, cut, geom, 1000, TEST_W, TEST_H);
             CHECK(st != FD_OK);
         }
         char *bad = malloc(len);
         memcpy(bad, text, len);
-        for (size_t k = 0; k < len; k += 97) { bad[k] ^= 0x55; decode_chunked(bad, len, geom, 1000, OUT_MAX_W, OUT_MAX_H); bad[k] ^= 0x55; }
+        for (size_t k = 0; k < len; k += 97) { bad[k] ^= 0x55; decode_chunked(bad, len, geom, 1000, TEST_W, TEST_H); bad[k] ^= 0x55; }
         free(bad); free(text);
-        CHECK(decode_chunked("{\"v\":2,\"ops\":[]}", 16, geom, 100, OUT_MAX_W, OUT_MAX_H) == FD_ERR_VERSION);
-        CHECK(decode_chunked("{\"v\":3,\"ops\":[],\"static\":{\"id\":\"s-nope\"}}", 41, geom, 5, OUT_MAX_W, OUT_MAX_H) == FD_ERR_STATIC_MISSING);
+        CHECK(decode_chunked("{\"v\":2,\"ops\":[]}", 16, geom, 100, TEST_W, TEST_H) == FD_ERR_VERSION);
+        CHECK(decode_chunked("{\"v\":3,\"ops\":[],\"static\":{\"id\":\"s-nope\"}}", 41, geom, 5, TEST_W, TEST_H) == FD_ERR_STATIC_MISSING);
     }
     printf(failures ? "test_frame: %d failure(s)\n" : "test_frame: OK\n", failures);
     return failures ? 1 : 0;

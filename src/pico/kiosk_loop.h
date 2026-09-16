@@ -4,6 +4,8 @@
 #include <stdint.h>
 
 void kiosk_loop_init(void);
+// Rendering only (no HTTP, no Wi-Fi): for radio-less diagnostic builds.
+void kiosk_loop_init_display_only(void);
 void kiosk_loop_poll(void);          // main loop step, non-blocking
 // Diagnostics for the console.
 void kiosk_loop_status(char *buf, size_t cap);

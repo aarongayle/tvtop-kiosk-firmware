@@ -16,6 +16,9 @@
 #include <string.h>
 
 #include "provision.h"
+#ifndef PROVISION_HOST_TEST
+#include "ddc.h"
+#endif
 #include "flash_store.h"
 #include "kiosk_config.h"
 #include "builtin_frames.h"
@@ -38,6 +41,7 @@ static uint32_t free_heap(void) { return 12345; }
 #include "pico/stdio.h"
 #include "pico/time.h"
 #include "hardware/watchdog.h"
+#include "hardware/structs/watchdog.h"
 #include "lwip/tcp.h"
 #include "lwip/pbuf.h"
 #include <malloc.h>
@@ -528,12 +532,24 @@ static int split_args(char *s, char *argv[], int max) {
 }
 
 static void do_reboot(const char *why) {
+#ifndef PROVISION_HOST_TEST
+    // watchdog_reboot restarts its countdown on every call, and the provisioning save asks again on
+    // every poll until the reboot happens: re-arming each time postponed the reboot forever and left
+    // the kiosk on its setup screen. Arm it exactly once.
+    static bool armed;
+    if (armed) return;
+    armed = true;
+#endif
     printf("rebooting: %s\n", why);
 #ifdef PROVISION_HOST_TEST
     host_reboot_hook();
 #else
     stdio_flush();
     watchdog_reboot(0, 0, 200);
+    // Returning would let the main loop feed the watchdog, which reloads its normal 8 s timeout and
+    // cancels the reboot: the kiosk then sat on its setup screen with the new settings saved. Wait here
+    // for the reset instead; video keeps running on core 1 until it happens.
+    for (;;) tight_loop_contents();
 #endif
 }
 
@@ -554,6 +570,10 @@ static void print_status(void) {
            KIOSK_FW_VERSION, (unsigned)free_heap(), (unsigned)(provision_now_ms() / 1000u));
 }
 
+#ifndef KIOSK_MODE_NAMES   // host tests compile this file without board.h
+#define KIOSK_MODE_NAMES "720p30|720p30rb|480p60|720x480p60|960x540p60|1066x600p50"
+#endif
+
 static void print_help(void) {
     printf("commands:\n"
            "  help                     this list\n"
@@ -561,12 +581,24 @@ static void print_help(void) {
            "  stats                    render/scanout counters\n"
            "  wifi <ssid> [password]   join a network (quote an ssid with spaces; no password = open)\n"
            "  server <url>             kiosk server base, e.g. server http://192.168.1.10:8080\n"
-           "  mode <720p30|720p30rb|480p60>   video mode (reboots)\n"
+           "  mode <" KIOSK_MODE_NAMES ">   video mode (reboots)\n"
            "  scan                     list nearby networks\n"
            "  reset                    forget the registration token (re-pair), keep wifi\n"
            "  factory                  forget everything and reboot into provisioning\n"
            "  reboot\n"
-           "  test                     show the test pattern\n");
+           "  test                     show the test pattern\n"
+           "diagnostics:\n"
+           "  stats                    also prints wifi rssi, channel, and whether DVI is silenced\n"
+           "  edid                     read the monitor's EDID over DDC (decode with tools/edid_decode.py)\n"
+           "  label <text> | solid     draw a labelled or plain test frame\n"
+           "  bench                    time the scanline expander\n"
+           "  pads <2|4|8|12> [fast]   TMDS pad drive and slew\n"
+           "  smps pwm|save            3V3 regulator mode\n"
+           "  sigsweep                 cycle pad and regulator settings, 20 s each\n"
+           "  tmds off|on              silence the DVI pins (Wi-Fi interference test); kept across resets\n"
+           "  norender [off]           decode frames without drawing them; kept across resets\n"
+           "the video clock follows the Wi-Fi channel so DVI harmonics stay out of it; the kiosk\n"
+           "reboots once when it joins a channel that needs a different clock\n");
 }
 
 static void apply_and_restart(void) {
@@ -589,10 +621,84 @@ static void console_exec(char *line) {
         kiosk_loop_status(buf, sizeof buf);
         printf("%s\n", buf);
 #ifndef PROVISION_HOST_TEST
-        printf("scanout: %u frames, %u late lines, worst line %u cycles\n",
-               (unsigned)scanout_frames(), (unsigned)scanout_late_lines(), (unsigned)scanout_max_line_cycles());
+        scanout_profile_t sp;
+        scanout_profile(&sp);
+        printf("scanout: %s expander, %u frames, red (missed) lines %u, dropped late lines %u since boot\n"
+               "scanout: worst line %u cycles (%u span bytes, y=%u), worst IRQ %u cycles, line budget %u cycles, %u line buffers, %u lines over budget since boot\n",
+               scanout_expander_name(), (unsigned)sp.frames, (unsigned)sp.missed_lines, (unsigned)sp.dropped_lines,
+               (unsigned)sp.worst_line_cycles, (unsigned)sp.worst_line_span_bytes, (unsigned)sp.worst_line_y,
+               (unsigned)sp.irq_max_cycles, (unsigned)sp.line_budget_cycles, (unsigned)sp.tmds_buffers, (unsigned)sp.over_budget_lines);
 #endif
         printf("heap free: %u bytes, uptime %u s\n", (unsigned)free_heap(), (unsigned)(provision_now_ms() / 1000u));
+#ifndef PROVISION_HOST_TEST
+        printf("wifi rssi: %d dBm, channel %d, tmds %s\n", net_wifi_rssi(), net_wifi_channel(), watchdog_hw->scratch[3] == 0x544d4f46u ? "off" : "on");
+#endif
+#ifndef PROVISION_HOST_TEST
+    } else if (strcmp(cmd, "bench") == 0) {
+        scanout_bench();
+    } else if (strcmp(cmd, "pads") == 0) {
+        int ma = argc >= 2 ? atoi(argv[1]) : 0;
+        uint8_t code = ma >= 12 ? 3 : ma >= 8 ? 2 : ma >= 4 ? 1 : 0;
+        bool fast = argc >= 3 && strcmp(argv[2], "fast") == 0;
+        scanout_set_pads(code, fast);
+        printf("TMDS pads: %u mA, %s slew\n", 2u << code > 8 ? 12u : 2u << code, fast ? "fast" : "slow");
+    } else if (strcmp(cmd, "smps") == 0) {
+        bool pwm = argc >= 2 && strcmp(argv[1], "pwm") == 0;
+        net_wifi_smps_pwm(pwm);
+        printf("3V3 regulator: %s mode\n", pwm ? "PWM (low ripple)" : "power-save");
+    } else if (strcmp(cmd, "sigsweep") == 0) {
+        static const struct { uint8_t drive; bool fast, pwm; const char *label; } steps[] = {
+            { 0, false, false, "1: 2mA slow" },
+            { 3, true,  false, "2: 12mA fast" },
+            { 2, true,  false, "3: 8mA fast" },
+            { 1, true,  false, "4: 4mA fast" },
+            { 3, false, false, "5: 12mA slow" },
+            { 3, true,  true,  "6: 12mA fast PWM" },
+            { 0, false, true,  "7: 2mA slow PWM" },
+        };
+        const unsigned n = sizeof steps / sizeof steps[0];
+        for (unsigned i = 0; i < n; i++) {
+            scanout_set_pads(steps[i].drive, steps[i].fast);
+            net_wifi_smps_pwm(steps[i].pwm);
+            kiosk_show_builtin(BUILTIN_LABEL, steps[i].label, NULL);
+            printf("[sweep %u/%u] %s\n", i + 1, n, steps[i].label);
+            for (int t = 0; t < 200; t++) { sleep_ms(100); watchdog_update(); }
+        }
+        scanout_set_pads(0, false);
+        net_wifi_smps_pwm(false);
+        kiosk_show_builtin(BUILTIN_LABEL, "sweep done", NULL);
+        printf("[sweep] done; restored 2 mA slow, power-save\n");
+    } else if (strcmp(cmd, "edid") == 0) {
+        // Raw blocks for tools/edid_decode.py; the first line says whether the display answered.
+        uint8_t e[128];
+        if (!ddc_read_edid(0, e)) { printf("edid: no answer from the display on DDC\n"); return; }
+        printf("EDIDHEX0 ");
+        for (int i = 0; i < 128; i++) printf("%02x", e[i]);
+        printf("\n");
+        for (uint8_t b = 1; b <= e[126] && b <= 3; b++) {
+            uint8_t x[128];
+            if (!ddc_read_edid(b, x)) { printf("edid: extension block %u read failed\n", b); break; }
+            printf("EDIDHEX%u ", b);
+            for (int i = 0; i < 128; i++) printf("%02x", x[i]);
+            printf("\n");
+        }
+    } else if (strcmp(cmd, "label") == 0) {
+        const char *text = argc >= 2 ? argv[1] : "";
+        kiosk_show_builtin(BUILTIN_LABEL, text, NULL);
+        printf("label: %s\n", text);
+    } else if (strcmp(cmd, "tmds") == 0) {
+        bool on = argc >= 2 && strcmp(argv[1], "on") == 0;
+        watchdog_hw->scratch[3] = on ? 0u : 0x544d4f46u;
+        scanout_set_tmds_enabled(on);
+        printf("tmds %s: DVI output %s (kept across watchdog resets)\n", on ? "on" : "off", on ? "restored" : "silenced, pins held low");
+    } else if (strcmp(cmd, "norender") == 0) {
+        bool on = !(argc >= 2 && strcmp(argv[1], "off") == 0);
+        watchdog_hw->scratch[2] = on ? 0x4e4f5244u : 0u;
+        printf("norender %s: received frames are %s (kept across watchdog resets)\n", on ? "on" : "off", on ? "decoded but not drawn" : "drawn");
+    } else if (strcmp(cmd, "solid") == 0) {
+        if (!kiosk_show_builtin(BUILTIN_SOLID, NULL, NULL)) printf("error: could not draw the solid frame\n");
+        else printf("drew blue / white / green bands\n");
+#endif
     } else if (strcmp(cmd, "wifi") == 0) {
         if (argc < 2 || !argv[1][0]) { printf("usage: wifi <ssid> [password]\n"); return; }
         const char *ssid = argv[1], *pass = argc >= 3 ? argv[2] : "";
@@ -612,7 +718,7 @@ static void console_exec(char *line) {
         printf("server: %s%s\n", kiosk_config.server_base, changed ? " (registration forgotten; the kiosk will register again)" : " (unchanged)");
         apply_and_restart();
     } else if (strcmp(cmd, "mode") == 0) {
-        if (argc < 2) { printf("usage: mode <720p30|720p30rb|480p60>\n"); return; }
+        if (argc < 2) { printf("usage: mode <" KIOSK_MODE_NAMES ">\n"); return; }
         video_mode_t m = video_mode_from_name(argv[1]);
         if (strcmp(video_mode_info(m)->name, argv[1]) != 0) { printf("error: unknown mode\n"); return; }
         kiosk_config.video_mode = (uint8_t)m;

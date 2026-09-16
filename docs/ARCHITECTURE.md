@@ -117,7 +117,7 @@ CONNECTED ─ no token ──► GET /v1/register?model=&fw=  → store token, n
 LOOP:  GET next_url (receive timeout 45 s)
          200 → decode; if static id unknown and no defs → keep frame, next = /v1/config
                else render, persist next_url when its shape (minus rev) changed
-         304 → nothing; 404 → next = /v1/config?t=;  error → backoff 1..60 s full jitter,
+         304 → nothing; 404 → next = /v1/config?t= (3× from /v1/config itself → re-register);  error → backoff 1..60 s full jitter,
                after 2 failures overlay the offline indicator on the last good frame
 ```
 Firmware-owned screens are themselves JSON frames (`builtin_frames.c`) drawn by the same renderer.

@@ -9,15 +9,16 @@ list(FILTER COMMON_SRC EXCLUDE REGEX "geom_flash\\.c$")
 
 add_library(kiosk_common STATIC ${COMMON_SRC})
 target_include_directories(kiosk_common PUBLIC ${COMMON} ${CMAKE_CURRENT_LIST_DIR}/../vendor/stb)
-target_compile_definitions(kiosk_common PUBLIC KIOSK_HOST=1 KIOSK_BAND_LINES=16 KIOSK_SCRATCH_BYTES=262144 KIOSK_MAX_OPS=4096 KIOSK_ARENA_BYTES=65536)
+# OUT_MAX 1920x1080 so the renderer and tests cover the Pico 2 W's 1080p modes as well as 720p.
+target_compile_definitions(kiosk_common PUBLIC KIOSK_HOST=1 KIOSK_BAND_LINES=16 KIOSK_SCRATCH_BYTES=262144 KIOSK_MAX_OPS=4096 KIOSK_ARENA_BYTES=65536 OUT_MAX_W=1920 OUT_MAX_H=1080)
 
 # The device encoder is portable C with an asm fast path; the C version is tested here.
-add_library(kiosk_encoder STATIC ${CMAKE_CURRENT_LIST_DIR}/../src/pico/tmds_rle_encode.c)
+add_library(kiosk_encoder STATIC ${CMAKE_CURRENT_LIST_DIR}/../src/pico/tmds_wr.c ${CMAKE_CURRENT_LIST_DIR}/../src/pico/hstx_line.c)
 target_include_directories(kiosk_encoder PUBLIC ${COMMON} ${CMAKE_CURRENT_LIST_DIR}/../src/pico)
 target_compile_definitions(kiosk_encoder PUBLIC KIOSK_HOST=1)
 
 add_executable(render_frame render_frame.c)
-target_link_libraries(render_frame kiosk_common m)
+target_link_libraries(render_frame kiosk_common kiosk_encoder m)
 add_executable(imgdiff imgdiff.c)
 target_include_directories(imgdiff PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../vendor/stb)
 target_link_libraries(imgdiff m)
