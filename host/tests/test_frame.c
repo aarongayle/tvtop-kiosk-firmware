@@ -76,6 +76,20 @@ int main(void) {
     CHECK(font_init(font_blob, font_blob_size));
     geom_store_t *geom = geom_ram_create(2u << 20);
     palette_init(&g_pal);
+
+    // A frame is scaled from the canvas it declares: 1920×1080 drawn at 1920×1080 is 1:1 and at
+    // 960×540 exactly half; a frame without w/h keeps the 1280×720 default.
+    {
+        static const char big[] = "{\"v\":3,\"w\":1920,\"h\":1080,\"bg\":\"#FFFFFF\",\"ops\":[[\"r\",300,150,90,60,\"#FF0000\",0]]}";
+        static const char old[] = "{\"v\":3,\"bg\":\"#FFFFFF\",\"ops\":[[\"r\",300,150,90,60,\"#FF0000\",0]]}";
+        CHECK(decode_chunked(big, sizeof big - 1, geom, 5, 1920, 1080) == FD_OK && g_frame.nops == 1);
+        CHECK(g_frame.ops[0].v[0] == 300 * PX8_ONE && g_frame.ops[0].v[2] == 90 * PX8_ONE);
+        CHECK(decode_chunked(big, sizeof big - 1, geom, 5, 960, 540) == FD_OK && g_frame.nops == 1);
+        CHECK(g_frame.ops[0].v[0] == 150 * PX8_ONE && g_frame.ops[0].v[3] == 30 * PX8_ONE);
+        CHECK(decode_chunked(old, sizeof old - 1, geom, 5, 1920, 1080) == FD_OK && g_frame.nops == 1);
+        CHECK(g_frame.ops[0].v[0] == 450 * PX8_ONE && g_frame.ops[0].v[2] == 135 * PX8_ONE);
+    }
+
     DIR *d = opendir("test/fixtures");
     CHECK(d != NULL);
     if (!d) return 1;
