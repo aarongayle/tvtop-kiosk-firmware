@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include "hardware/dma.h"
 #include "hardware/irq.h"
+#include "hardware/structs/systick.h"
 
 #include "dvi.h"
 #include "dvi_timing.h"
@@ -194,6 +195,7 @@ static void __dvi_func(dvi_dma_irq_handler)(struct dvi_inst *inst) {
 		// position on-screen. Just pass it back.
 		queue_add_blocking_u32(&inst->q_tmds_free, &tmdsbuf);
 		--inst->late_scanline_ctr;
+		++inst->stat_dropped_lines;
 	}
 
 	if (inst->timing_state.v_state != DVI_STATE_ACTIVE) {
@@ -209,6 +211,7 @@ static void __dvi_func(dvi_dma_irq_handler)(struct dvi_inst *inst) {
 	else {
 		// No valid scanline was ready (generates solid red scanline)
 		tmdsbuf = NULL;
+		++inst->stat_missed_lines;
 		if (inst->timing_state.v_ctr % DVI_VERTICAL_REPEAT == DVI_VERTICAL_REPEAT - 1)
 			++inst->late_scanline_ctr;
 	}
@@ -237,8 +240,11 @@ static void __dvi_func(dvi_dma_irq_handler)(struct dvi_inst *inst) {
 
 static void __dvi_func(dvi_dma0_irq)() {
 	struct dvi_inst *inst = dma_irq_privdata[0];
+	uint32_t t0 = systick_hw->cvr;
 	dma_hw->ints0 = 1u << inst->dma_cfg[TMDS_SYNC_LANE].chan_data;
 	dvi_dma_irq_handler(inst);
+	uint32_t dt = (t0 - systick_hw->cvr) & 0xFFFFFFu;
+	if (dt > inst->stat_irq_max_cycles) inst->stat_irq_max_cycles = dt;
 }
 
 static void __dvi_func(dvi_dma1_irq)() {

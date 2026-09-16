@@ -23,7 +23,8 @@ typedef struct {
     char static_id[KIOSK_MAX_STATIC_ID];
     uint8_t video_mode;         // video_mode_t
     uint8_t flags;              // bit0: tls verification disabled (dev)
-    uint8_t reserved[62];
+    uint8_t wifi_channel;       // 2.4 GHz channel last joined (1-14), 0 = unknown; picks the video clock
+    uint8_t reserved[61];
     uint32_t crc32;             // of everything above
 } kiosk_config_t;
 

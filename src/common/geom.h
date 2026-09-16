@@ -36,7 +36,11 @@ geom_store_t *geom_ram_create(size_t capacity);
 geom_store_t *geom_flash_get(void);
 
 // ---- reading ----
-bool geom_store_open(geom_store_t *g, const char *static_id);   // true if a complete set with this id is present
+// Records are stored in device pixels, so a set only fits the resolution it was decoded at. Set the
+// output size before opening or writing; a set decoded for another size refuses to open, and the
+// kiosk fetches it again. 0 x 0 (the host tools) accepts any set.
+void geom_store_set_resolution(geom_store_t *g, uint16_t w, uint16_t h);
+bool geom_store_open(geom_store_t *g, const char *static_id);   // true if a complete set with this id, for this resolution, is present
 bool geom_store_is_open(const geom_store_t *g);
 const char *geom_store_id(const geom_store_t *g);
 const geom_rec_t *geom_store_get(const geom_store_t *g, uint16_t id);   // NULL if absent

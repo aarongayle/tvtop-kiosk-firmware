@@ -60,6 +60,29 @@ static void test_add_find(void) {
     palette_add(&p, 0x808080);
     CHECK(p.dirty_from == 3 && p.count == 4);
     CHECK(p.stats_overflow == 0);
+    {
+        // Distinct light colours stay distinct even where the balanced levels are sparse.
+        palette_t lp;
+        palette_init(&lp);
+        uint8_t white = palette_add(&lp, 0xffffff);
+        uint8_t cream = palette_add(&lp, 0xf8f4ec);
+        CHECK(white != cream);
+        CHECK(palette_rgb(&lp, white) == RGB(239, 239, 239));
+        CHECK(palette_rgb(&lp, cream) == RGB(239, 239, 221));
+        CHECK(palette_add(&lp, 0xf8f4ec) == cream);        // the same source finds its entry again
+        CHECK(palette_add(&lp, 0xfdfdfd) == white);        // near-identical sources still share one
+        palette_t order;                                   // the same result when cream arrives first
+        palette_init(&order);
+        uint8_t cream_first = palette_add(&order, 0xf8f4ec);
+        uint8_t white_second = palette_add(&order, 0xffffff);
+        CHECK(cream_first != white_second);
+        CHECK(palette_rgb(&order, cream_first) == RGB(239, 239, 221));
+        CHECK(palette_rgb(&order, white_second) == RGB(239, 239, 239));
+        CHECK(palette_rgb(&order, palette_add(&order, 0xf2f2f2)) == RGB(221, 221, 221));   // neutral grey stays neutral
+        uint16_t gen = lp.generation;
+        palette_reset(&lp);
+        CHECK(lp.generation != gen);
+    }
 }
 
 // Fills the palette with 256 distinct quantised colours (there are 52^3 to choose from).

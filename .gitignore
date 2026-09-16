@@ -9,3 +9,4 @@ host/build/
 *.map
 .DS_Store
 host/out/
+*.log

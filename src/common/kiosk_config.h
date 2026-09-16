@@ -4,13 +4,26 @@
 #include <stdint.h>
 
 #define KIOSK_FW_VERSION "0.1.0"
+#ifndef KIOSK_MODEL
+#define KIOSK_MODEL "pico-w" // CMake sets it from PICO_BOARD (pico-w, pico2-w); this covers host builds
+#endif
 #define KIOSK_PROTOCOL_VERSION 3
 
 // Wire canvas (protocol) and the largest output mode we drive.
 #define CANVAS_W 1280
 #define CANVAS_H 720
+#ifndef KIOSK_HSTX
+#define KIOSK_HSTX 0
+#endif
+#ifndef OUT_MAX_W
+#if KIOSK_HSTX
+#define OUT_MAX_W 1920   // the Pico 2 W can output 1080p at 24-30 Hz (the 720p60 bit rate)
+#define OUT_MAX_H 1080
+#else
 #define OUT_MAX_W 1280
 #define OUT_MAX_H 720
+#endif
+#endif
 
 // Fixed point: device coordinates carry 3 fractional bits ("px8").
 #define PX8_SHIFT 3
@@ -21,6 +34,15 @@
 #ifndef KIOSK_BAND_LINES
 #define KIOSK_BAND_LINES 8          // scanlines rasterised per band (8 bpp band buffer)
 #endif
+// Platform: KIOSK_HSTX selects the RP2350 HSTX video backend (Pico 2 W); KIOSK_FULL_COLOUR keeps
+// palette colours exact instead of rounding them to DC-balanced TMDS levels for the RP2040 encoder.
+#ifndef KIOSK_HSTX
+#define KIOSK_HSTX 0
+#endif
+#ifndef KIOSK_FULL_COLOUR
+#define KIOSK_FULL_COLOUR 0
+#endif
+
 #ifndef KIOSK_MAX_OPS
 #define KIOSK_MAX_OPS 1000          // dynamic frame op table
 #endif
@@ -43,7 +65,7 @@
 #endif
 // Render-time split: [0, KIOSK_BAND_LINES*OUT_MAX_W) band buffer, then RASTER_SCRATCH_BYTES.
 #ifndef KIOSK_LINEPOOL_BYTES
-#define KIOSK_LINEPOOL_BYTES (84 * 1024)   // largest measured need: 77 KB (Europe board at 720p)
+#define KIOSK_LINEPOOL_BYTES (84 * 1024)   // a full World map at 960x540 needs ~65 KB; the rest is headroom for denser maps (from ~18 KB of idle heap)
 #endif
 #ifndef KIOSK_MAX_CROSSINGS
 #define KIOSK_MAX_CROSSINGS 128     // polygon edge crossings kept per scanline
@@ -68,7 +90,12 @@
 #endif
 
 // Line pool encoding: each scanline is (index, run-1) byte pairs, runs of 1..256 pixels.
+#if KIOSK_HSTX
+// HSTX lines are packed runs, four bytes each (hstx_line.h): a line of single pixels is 4 KB.
+#define LINE_MAX_BYTES (OUT_MAX_W * 4)
+#else
 #define LINE_MAX_BYTES (OUT_MAX_W * 2)
+#endif
 
 // Flash layout (RP2040 Pico W, 2 MB). Offsets are from the start of flash.
 #ifndef KIOSK_GEOM_FLASH_OFFSET

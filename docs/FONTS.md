@@ -8,7 +8,7 @@ tools). `src/common/font.h` documents the byte layout; `src/common/font.c` reads
 
 | Part | Content | Bytes |
 |---|---|---|
-| bitmap faces, regular | 10 12 13 14 16 19 22 24 26 px, 2 bpp coverage | 76 532 |
+| bitmap faces, regular | 7 8 9 10 11 12 13 14 16 19 22 24 26 px, 2 bpp coverage | 76 532 |
 | bitmap faces, bold | same sizes | 80 609 |
 | outlines, regular | every charset glyph as TrueType quadratic contours, font units | 37 308 |
 | outlines, bold | same | 36 936 |
@@ -48,7 +48,7 @@ size list and charset rules above, so update both when changing them.
 `font_bitmap_size_for(size_px)`:
 
 * `size_px > KIOSK_FONT_BITMAP_MAX` (26): no bitmap; the outline path is used.
-* otherwise the nearest available size, **ties round up**: 11 → 12, 15 → 16, 17 → 16, 18 → 19,
+* otherwise the nearest available size, **ties round up**: 15 → 16, 17 → 16, 18 → 19,
   20 → 19, 21 → 22, 23 → 24, 25 → 26, anything ≤ 10 → 10.
 
 `font_measure`, `font_extent` and `font_draw` all use the snapped face, so layout is consistent

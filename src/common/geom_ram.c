@@ -49,6 +49,7 @@ bool geom_store_commit(geom_store_t *g) {
     g->rd_data_begin = 0;
     g->rd_data_end = g->wr_off;
     g->ndefs = g->wr_ndefs;
+    g->set_wh = g->res_wh;
     memcpy(g->id, g->wr_id, sizeof g->id);
     g->present = true;
     g->open = true;
@@ -62,6 +63,6 @@ void geom_store_abort(geom_store_t *g) {
 
 bool geom_store_open(geom_store_t *g, const char *static_id) {
     g->open = g->present && static_id && strncmp(g->id, static_id, KIOSK_MAX_STATIC_ID) == 0
-              && strlen(static_id) < KIOSK_MAX_STATIC_ID;
+              && strlen(static_id) < KIOSK_MAX_STATIC_ID && (g->res_wh == 0 || g->set_wh == g->res_wh);
     return g->open;
 }

@@ -25,7 +25,7 @@ Output: `build/tvtop_kiosk.uf2`. Options:
 |---|---|---|
 | `PICO_BOARD` | `pico_w` | `pico_w` or `pico2_w` (the Pico 2 W build is untested) |
 | `KIOSK_TLS` | `OFF` | build mbedTLS so `https://` servers work (`build-tls/` is a second tree with it on) |
-| `KIOSK_VIDEO_MODE` | `720p30` | default mode until one is stored: `720p30`, `720p30rb`, `480p60` |
+| `KIOSK_VIDEO_MODE` | `720p30` | default mode until one is stored: `720p30`, `720p30rb`, `480p60`, `720x480p60`, `960x540p60`, `1066x600p50` |
 | `KIOSK_SERVER_BASE` | `https://kiosk.tvtop.games` | default server (`server <url>` on the console overrides) |
 | `KIOSK_WIFI_SSID` / `KIOSK_WIFI_PASSWORD` | empty | compile-in credentials to skip provisioning on a bench unit |
 
@@ -48,6 +48,22 @@ picotool load -f build/tvtop_kiosk.uf2 && picotool reboot
 
 Then open the USB serial console (`screen /dev/tty.usbmodem* 115200` or any terminal) to watch
 the boot banner and to provision (`docs/PROVISIONING.md`).
+
+## Pico 2 W (RP2350)
+
+The same sources build for the Pico 2 W. CMake picks the video backend from the board: HSTX
+(`src/pico/scanout_hstx.c`) on the RP2350, PicoDVI's libdvi (`src/pico/scanout.c`) on the RP2040.
+Use a separate build directory:
+
+```bash
+cmake -S . -B build-pico2w -G Ninja -DPICO_BOARD=pico2_w
+cmake --build build-pico2w
+picotool load -f -v -x build-pico2w/tvtop_kiosk.uf2
+```
+
+The default video mode is `720p60`; `1080p30` (and `1080p25` / `1080p24` for TVs), `960x540p60` and `480p60` are
+the alternatives (console `mode`).
+The Pico 2 W build uses the last sector of its 4 MB flash for the config and a 192 KB line pool.
 
 ## Host build (tests and the renderer)
 

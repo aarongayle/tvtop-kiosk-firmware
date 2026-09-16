@@ -10,6 +10,7 @@
 #include <string.h>
 #include "pico/stdlib.h"
 #include "pico/rand.h"
+#include "hardware/clocks.h"
 #include "kiosk_loop.h"
 #include "kiosk_config.h"
 #include "flash_store.h"
@@ -27,6 +28,8 @@
 #include "json.h"
 #include "builtin_frames.h"
 #include "ca_certs.h"
+#include "hardware/watchdog.h"
+#include "hardware/structs/watchdog.h"
 
 extern linepool_t kiosk_linepool;
 
@@ -70,7 +73,7 @@ static void config_url(char *out, size_t cap) {
 }
 
 static void register_url(char *out, size_t cap) {
-    snprintf(out, cap, "%s/v1/register?model=pico-w&fw=%s", kiosk_config.server_base, KIOSK_FW_VERSION);
+    snprintf(out, cap, "%s/v1/register?model=%s&fw=%s", kiosk_config.server_base, KIOSK_MODEL, KIOSK_FW_VERSION);
 }
 
 // Copies url without its rev=… query parameter, so two URLs that differ only by revision compare
@@ -126,7 +129,7 @@ static void line_sink(void *ctx, uint16_t y, const uint8_t *px, uint16_t width) 
     sink_ctx_t *s = ctx;
     uint8_t *p = linepool_alloc(&kiosk_linepool, y, LINE_MAX_BYTES);
     if (!p) { linepool_commit_dup(&kiosk_linepool, y); return; }
-    uint16_t n = rle_encode_line(px, width, p, LINE_MAX_BYTES);
+    uint16_t n = scanout_encode_line(px, width, p, LINE_MAX_BYTES);
     if (!n) { linepool_commit_dup(&kiosk_linepool, y); return; }
     linepool_commit(&kiosk_linepool, y, p, n);
     s->bytes += n;
@@ -141,6 +144,7 @@ static void render_frame_now(void) {
         if (overlay_offline && frame_make_overlay_icon(&extra[nextra], mode->w, mode->h, 1198, 648, 44, icon_lookup("wifi", 4), ink)) nextra++;
         else if (overlay_version && frame_make_overlay_icon(&extra[nextra], mode->w, mode->h, 1198, 648, 44, icon_lookup("warning", 7), warn)) nextra++;
     }
+    scanout_frame_begin();
     scanout_upload_palette(&pal);   // colours the decoder added must be live before their lines are
     raster_t r;
     raster_init(&r, scratch, raster_scratch, mode->w, mode->h, &pal);
@@ -216,6 +220,55 @@ static void enter_backoff(const char *why) {
     }
 }
 
+// A radio that reports the link up while every request times out has wedged its driver (seen as an
+// endless "[CYW43] STALL ... send_ethernet failed"). Nothing short of a reset recovers it, and a
+// reboot resumes the cached next_url and the static set from flash within seconds. The count of
+// such reboots survives the reset in a watchdog scratch register so a genuine outage (a server
+// that accepts connections but never answers) backs off instead of reboot-looping.
+#define WEDGE_TIMEOUTS 3
+#define WEDGE_REBOOT_LIMIT 3
+#define WEDGE_MAGIC 0x57454400u
+static uint32_t consecutive_timeouts;
+static uint32_t request_started_ms;   // when the current poll request began, for error logs
+
+static void wedge_check(void) {
+    if (consecutive_timeouts < WEDGE_TIMEOUTS || net_wifi_state() != WIFI_UP) return;
+    uint32_t s = watchdog_hw->scratch[0];
+    uint32_t n = (s & 0xffffff00u) == WEDGE_MAGIC ? (s & 0xffu) : 0u;
+    if (n >= WEDGE_REBOOT_LIMIT) return;
+    watchdog_hw->scratch[0] = WEDGE_MAGIC | (n + 1u);
+    printf("kiosk: %lu timeouts in a row with the link up; resetting (recovery %lu of %u)\n",
+           (unsigned long)consecutive_timeouts, (unsigned long)(n + 1u), WEDGE_REBOOT_LIMIT);
+    watchdog_reboot(0, 0, 100);
+    for (;;) tight_loop_contents();
+}
+
+// The video clock depends on the Wi-Fi channel (see video_mode_clock_khz), but the clock is set at
+// boot and the channel is only known after joining. Remember the channel; when the access point is
+// on a channel whose clock differs from the one running, save it and reboot so video comes back on
+// a frequency that leaves the radio alone. At most two such reboots in a row (watchdog scratch 4),
+// so an access point that changes channel on every join cannot reboot-loop the kiosk.
+#define RETUNE_MAGIC 0x52544e00u
+static void retune_for_channel(void) {
+    int ch = net_wifi_channel();
+    uint32_t s = watchdog_hw->scratch[4];
+    uint32_t n = (s & 0xffffff00u) == RETUNE_MAGIC ? (s & 0xffu) : 0u;
+    if (ch < 1 || ch > 14) return;
+    uint32_t want = video_mode_clock_khz((video_mode_t)kiosk_config.video_mode, (uint8_t)ch);
+    uint32_t have = (uint32_t)(clock_get_hz(clk_sys) / 1000u);
+    if (kiosk_config.wifi_channel != (uint8_t)ch) {
+        kiosk_config.wifi_channel = (uint8_t)ch;
+        if (want == have) config_mark_dirty();
+    }
+    if (want == have) { if (n) watchdog_hw->scratch[4] = 0; return; }
+    if (n >= 2) { printf("wifi: channel %d wants a %lu kHz video clock; already retuned twice, staying at %lu kHz\n", ch, (unsigned long)want, (unsigned long)have); return; }
+    watchdog_hw->scratch[4] = RETUNE_MAGIC | (n + 1u);
+    if (!config_save()) printf("wifi: warning: config save failed\n");
+    printf("wifi: channel %d; moving the video clock from %lu to %lu kHz to keep DVI harmonics out of it (rebooting)\n", ch, (unsigned long)have, (unsigned long)want);
+    watchdog_reboot(0, 0, 100);
+    for (;;) tight_loop_contents();
+}
+
 static void reg_on_complete(void *ctx, int err, int status) {
     (void)ctx;
     request_active = false;
@@ -264,14 +317,40 @@ static void frame_on_complete(void *ctx, int err, int status) {
     uint32_t now = now_ms();
     if (err != HTTP_OK) {
         if (rsp_decoding) { frame_decoder_finish(&decoder); rsp_decoding = false; }
+        consecutive_timeouts = err == HTTP_ERR_TIMEOUT ? consecutive_timeouts + 1u : 0u;
+        if (err != HTTP_ERR_TIMEOUT) printf("kiosk: poll error %d after %lu ms\n", err, (unsigned long)(now - request_started_ms));
         enter_backoff(err == HTTP_ERR_TIMEOUT ? "poll timed out" : err == HTTP_ERR_URL ? "bad url" : "poll failed");
+        wedge_check();
         if (err == HTTP_ERR_URL) { config_url(cur_url, sizeof cur_url); if (strncmp(cur_url, "https:", 6) == 0) kiosk_show_builtin(BUILTIN_NO_TLS, cur_url, NULL); }
         return;
     }
     consecutive_failures = 0;
+    consecutive_timeouts = 0;
+    if (watchdog_hw->scratch[0]) watchdog_hw->scratch[0] = 0;   // the network works: recovery budget restored
     if (overlay_offline) overlay_offline = false;
     if (status == 304) { next_request_ms = now + POLL_FLOOR_MS; return; }
-    if (status == 404) { config_url(cur_url, sizeof cur_url); next_request_ms = now + POLL_FLOOR_MS; return; }
+    if (status == 404) {
+        // A 404 from a frame URL just means "start again from /config". A 404 from /config itself
+        // means the server no longer knows this token (its registry was reset, or the kiosk was
+        // deleted). Polling would never recover, so after a few in a row register afresh and show
+        // a new pairing code.
+        char cfg[KIOSK_MAX_URL];
+        config_url(cfg, sizeof cfg);
+        static uint8_t config_404s;
+        if (strcmp(cur_url, cfg) != 0) { config_404s = 0; strcpy(cur_url, cfg); next_request_ms = now + POLL_FLOOR_MS; return; }
+        if (++config_404s < 3) { next_request_ms = now + POLL_FLOOR_MS; return; }
+        config_404s = 0;
+        printf("kiosk: server does not know this kiosk; registering again\n");
+        kiosk_config.token[0] = 0;
+        kiosk_config.device_id[0] = 0;
+        kiosk_config.next_url[0] = 0;
+        kiosk_config.static_id[0] = 0;
+        if (!config_save()) printf("kiosk: warning: config save failed\n");
+        kiosk_show_builtin(BUILTIN_REGISTERING, NULL, NULL);
+        state = KS_REGISTER;
+        next_request_ms = now;
+        return;
+    }
     if (status != 200) { enter_backoff("unexpected status"); return; }
 
     uint32_t t0 = now_ms();
@@ -282,7 +361,8 @@ static void frame_on_complete(void *ctx, int err, int status) {
     case FD_OK:
         frame_valid = true;
         overlay_version = false;
-        render_frame_now();
+        if (watchdog_hw->scratch[2] == 0x4e4f5244u) printf("kiosk: frame %lu bytes decoded, not drawn (norender)\n", (unsigned long)stat_decode_ms);
+        else render_frame_now();
         if (frame.next_url[0]) strncpy(cur_url, frame.next_url, sizeof cur_url - 1); else config_url(cur_url, sizeof cur_url);
         cur_url[sizeof cur_url - 1] = 0;
         persist_next_url(cur_url, frame.static_id[0] ? frame.static_id : NULL);
@@ -311,14 +391,28 @@ static const http_sink_t frame_sink = { frame_on_status, NULL, frame_on_body, fr
 
 static void start_poll_state(void) {
     // Resume where we were if the persisted URL is usable: a URL that names a static set needs
-    // that set to still be in flash.
-    if (kiosk_config.next_url[0] && (!url_has_static(kiosk_config.next_url) || geom_store_is_open(geom)))
-        strncpy(cur_url, kiosk_config.next_url, sizeof cur_url - 1);
-    else
+    // that set to still be in flash. Resume at rev=0, though: the saved revision is the last frame
+    // drawn before a reboot or reconnect, and in a quiet game the server would hold that request
+    // open with nothing new to send, leaving a cleared or connecting screen up until someone moved.
+    // rev=0 answers at once with the current frame; the static set id still avoids a map download.
+    if (kiosk_config.next_url[0] && (!url_has_static(kiosk_config.next_url) || geom_store_is_open(geom))) {
+        char base[KIOSK_MAX_URL];
+        strip_rev(kiosk_config.next_url, base, sizeof base);
+        snprintf(cur_url, sizeof cur_url, "%s%crev=0", base, strchr(base, '?') ? '&' : '?');
+    } else {
         config_url(cur_url, sizeof cur_url);
+    }
     cur_url[sizeof cur_url - 1] = 0;
     next_request_ms = now_ms();
     state = KS_POLL;
+}
+
+void kiosk_loop_init_display_only(void) {
+    mode = video_mode_info((video_mode_t)kiosk_config.video_mode);
+    palette_init(&pal);
+    font_init(font_blob, font_blob_size);
+    geom = geom_flash_get();
+    geom_store_set_resolution(geom, mode->w, mode->h);   // a set cached for another mode must not open
 }
 
 void kiosk_loop_init(void) {
@@ -326,6 +420,7 @@ void kiosk_loop_init(void) {
     palette_init(&pal);
     font_init(font_blob, font_blob_size);
     geom = geom_flash_get();
+    geom_store_set_resolution(geom, mode->w, mode->h);   // a set cached for another mode must not open
     if (kiosk_config.static_id[0]) {
         if (geom_store_open(geom, kiosk_config.static_id)) printf("kiosk: static set %s restored from flash\n", kiosk_config.static_id);
     }
@@ -357,6 +452,7 @@ void kiosk_loop_poll(void) {
     case KS_WIFI_WAIT:
         if (net_wifi_state() != WIFI_UP) return;
         net_wifi_led(true);
+        retune_for_channel();
         if (!kiosk_config.token[0]) {
             kiosk_show_builtin(BUILTIN_REGISTERING, NULL, NULL);
             state = KS_REGISTER;
@@ -387,7 +483,7 @@ void kiosk_loop_poll(void) {
         if (request_active || (int32_t)(now - next_request_ms) < 0) return;
         {
             int rc = http_get(http_client_get(), cur_url, &frame_sink, NULL, LONG_POLL_TIMEOUT_MS);
-            if (rc == HTTP_OK) request_active = true;
+            if (rc == HTTP_OK) { request_active = true; request_started_ms = now; }
             else if (rc == HTTP_ERR_URL) {
                 // https without TLS support, or a URL we cannot parse: fall back to the config
                 // endpoint once, then halt on a screen that says what is wrong.
