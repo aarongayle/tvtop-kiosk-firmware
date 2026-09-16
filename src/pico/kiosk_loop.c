@@ -125,12 +125,18 @@ static void persist_next_url(const char *url, const char *static_id) {
 
 typedef struct { uint32_t bytes; } sink_ctx_t;
 
+// Encoded into scratch first, then only the bytes the line needs are taken from the pool. Reserving
+// the worst case (LINE_MAX_BYTES: 7.7 KB per line on HSTX at 1080p) on every line made a detailed
+// board fail to fit while old and new frames share the ring, and a line that fails is drawn as a
+// copy of the one above it — text near the bottom of the screen came out smeared and blocky.
 static void line_sink(void *ctx, uint16_t y, const uint8_t *px, uint16_t width) {
+    static uint8_t scratch[LINE_MAX_BYTES];   // core 0 only
     sink_ctx_t *s = ctx;
-    uint8_t *p = linepool_alloc(&kiosk_linepool, y, LINE_MAX_BYTES);
-    if (!p) { linepool_commit_dup(&kiosk_linepool, y); return; }
-    uint16_t n = scanout_encode_line(px, width, p, LINE_MAX_BYTES);
+    uint16_t n = scanout_encode_line(px, width, scratch, LINE_MAX_BYTES);
     if (!n) { linepool_commit_dup(&kiosk_linepool, y); return; }
+    uint8_t *p = linepool_alloc(&kiosk_linepool, y, n);
+    if (!p) { linepool_commit_dup(&kiosk_linepool, y); return; }
+    memcpy(p, scratch, n);
     linepool_commit(&kiosk_linepool, y, p, n);
     s->bytes += n;
 }
@@ -513,10 +519,11 @@ void kiosk_loop_status(char *buf, size_t cap) {
     }
     snprintf(buf, cap,
              "state=%s url=%s active=%d failures=%lu last_error=%s\n"
-             "frames=%lu decode_ms=%lu render_ms=%lu pool_bytes=%lu palette=%u static=%s\n"
+             "frames=%lu decode_ms=%lu render_ms=%lu pool_bytes=%lu/%lu pool_fail=%lu palette=%u static=%s\n"
              "video=%s late_lines=%lu vframes=%lu max_line_cycles=%lu",
              names[state], masked, request_active, (unsigned long)consecutive_failures, last_error[0] ? last_error : "-",
              (unsigned long)stat_frames, (unsigned long)stat_decode_ms, (unsigned long)stat_render_ms, (unsigned long)stat_pool_bytes,
+             (unsigned long)kiosk_linepool.size, (unsigned long)kiosk_linepool.stats_alloc_fail,
              pal.count, geom_store_is_open(geom) ? geom_store_id(geom) : "-",
              mode ? mode->name : "?", (unsigned long)scanout_late_lines(), (unsigned long)scanout_frames(), (unsigned long)scanout_max_line_cycles());
 }

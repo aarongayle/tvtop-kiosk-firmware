@@ -34,7 +34,8 @@ typedef struct {
     uint8_t sec;
     bool top_ok;                 // top-level value is an object
     bool have_v; int32_t v;
-    small_t sb;                  // bg (top level) and paint fill
+    uint16_t canvas_w, canvas_h; // from the frame's w/h; 0 = protocol default (1280×720)
+    small_t sb;                 // bg (top level) and paint fill
     small_t sc;                  // op small string #2 and paint stroke
     small_t sa;                  // op small string #1
     small_t kind;                // def element 0
@@ -68,15 +69,17 @@ _Static_assert(KIOSK_MAX_OPS <= 65535 && KIOSK_MAX_PAINTS <= 32767 && KIOSK_MAX_
 
 typedef struct { int32_t k_fx, ox8, oy8; } scale_t;
 
-// k = min(out_w/1280, out_h/720) so the whole canvas always fits; the unused strip (if the mode
-// is not 16:9) is split evenly into an integer px8 offset. For 16:9 modes k = out_w/1280 exactly.
-static void scale_setup(uint16_t out_w, uint16_t out_h, scale_t *s) {
-    if (out_w == 0 || out_h == 0) { s->k_fx = 1 << 16; s->ox8 = s->oy8 = 0; return; }
-    int32_t kx = (int32_t)(((int64_t)out_w << 16) / CANVAS_W);
-    int32_t ky = (int32_t)(((int64_t)out_h << 16) / CANVAS_H);
+// k = min(out_w/canvas_w, out_h/canvas_h) so the whole canvas always fits; the unused strip (if the
+// mode's shape differs) is split evenly into an integer px8 offset. The canvas is whatever the frame
+// declares in w/h (1920×1080 from the server, so a 1080p mode draws 1:1 and 960×540 exactly 1:2);
+// frames without them, and the built-in screens, are 1280×720.
+static void scale_setup(uint16_t out_w, uint16_t out_h, uint16_t canvas_w, uint16_t canvas_h, scale_t *s) {
+    if (out_w == 0 || out_h == 0 || canvas_w == 0 || canvas_h == 0) { s->k_fx = 1 << 16; s->ox8 = s->oy8 = 0; return; }
+    int32_t kx = (int32_t)(((int64_t)out_w << 16) / canvas_w);
+    int32_t ky = (int32_t)(((int64_t)out_h << 16) / canvas_h);
     s->k_fx = kx < ky ? kx : ky;
-    int32_t cw8 = (int32_t)(((int64_t)CANVAS_W * PX8_ONE * s->k_fx + 0x8000) >> 16);
-    int32_t ch8 = (int32_t)(((int64_t)CANVAS_H * PX8_ONE * s->k_fx + 0x8000) >> 16);
+    int32_t cw8 = (int32_t)(((int64_t)canvas_w * PX8_ONE * s->k_fx + 0x8000) >> 16);
+    int32_t ch8 = (int32_t)(((int64_t)canvas_h * PX8_ONE * s->k_fx + 0x8000) >> 16);
     s->ox8 = ((int32_t)out_w * PX8_ONE - cw8) / 2;
     s->oy8 = ((int32_t)out_h * PX8_ONE - ch8) / 2;
 }
@@ -624,7 +627,22 @@ static void top_scalar(frame_decoder_t *d, priv_t *p, const json_stream_t *js, j
             }
         }
     }
-    // w, h and unknown keys are ignored: the canvas is 1280×720 by protocol.
+    else if (key_is(js, 0, "w") || key_is(js, 0, "h")) {
+        int32_t v;
+        bool is_w = key_is(js, 0, "w");
+        if (ev == JSON_EV_NUMBER && json_number_to_int(data, len, &v) && (is_w ? (v >= 320 && v <= 3840) : (v >= 180 && v <= 2160))) {
+            if (is_w) p->canvas_w = (uint16_t)v;
+            else p->canvas_h = (uint16_t)v;
+            // Coordinates are scaled as they stream in, so a size that arrives after drawing began
+            // cannot apply; the server sends w and h first.
+            if (f->nops == 0 && !p->geom_begun) {
+                scale_t s;
+                scale_setup(d->out_w, d->out_h, p->canvas_w ? p->canvas_w : CANVAS_W, p->canvas_h ? p->canvas_h : CANVAS_H, &s);
+                d->k_fx = s.k_fx; d->ox8 = s.ox8; d->oy8 = s.oy8;
+            }
+        }
+    }
+    // Unknown keys are ignored.
 }
 
 static bool on_event(void *ctx, const json_stream_t *js, json_event_t ev, const char *data, size_t len, bool final) {
@@ -707,7 +725,7 @@ void frame_decoder_init(frame_decoder_t *d, frame_t *frame, palette_t *pal, geom
     d->scratch = scratch; d->scratch_len = scratch_len;
     d->out_w = out_w; d->out_h = out_h;
     scale_t s;
-    scale_setup(out_w, out_h, &s);
+    scale_setup(out_w, out_h, CANVAS_W, CANVAS_H, &s);
     d->k_fx = s.k_fx; d->ox8 = s.ox8; d->oy8 = s.oy8;
     d->status = FD_OK;
     json_stream_init(&d->js, on_event, d);
@@ -927,7 +945,7 @@ static bool fits_i16(int32_t v) { return v >= INT16_MIN && v <= INT16_MAX; }
 bool frame_make_overlay_icon(op_t *op, uint16_t out_w, uint16_t out_h, int x, int y, int size, int icon_index, uint8_t cidx) {
     if (!op || icon_index < 0 || icon_index >= ICON_COUNT || size <= 0) return false;
     scale_t s;
-    scale_setup(out_w, out_h, &s);
+    scale_setup(out_w, out_h, CANVAS_W, CANVAS_H, &s);
     int32_t x8 = scale_px8(&s, x * PX8_ONE, s.ox8), y8 = scale_px8(&s, y * PX8_ONE, s.oy8), size8 = scale_px8(&s, size * PX8_ONE, 0);
     if (!fits_i16(x8) || !fits_i16(y8) || !fits_i16(size8) || size8 <= 0) return false;
     memset(op, 0, sizeof *op);
@@ -939,7 +957,7 @@ bool frame_make_overlay_icon(op_t *op, uint16_t out_w, uint16_t out_h, int x, in
 bool frame_make_overlay_rect(op_t *op, uint16_t out_w, uint16_t out_h, int x, int y, int w, int h, int radius, uint8_t cidx, uint8_t alpha) {
     if (!op || w < 0 || h < 0 || radius < 0) return false;
     scale_t s;
-    scale_setup(out_w, out_h, &s);
+    scale_setup(out_w, out_h, CANVAS_W, CANVAS_H, &s);
     int32_t x0 = scale_px8(&s, x * PX8_ONE, s.ox8), y0 = scale_px8(&s, y * PX8_ONE, s.oy8);
     int32_t x1 = scale_px8(&s, (x + w) * PX8_ONE, s.ox8), y1 = scale_px8(&s, (y + h) * PX8_ONE, s.oy8);
     int32_t r8 = scale_px8(&s, radius * PX8_ONE, 0);

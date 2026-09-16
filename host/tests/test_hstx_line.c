@@ -70,27 +70,33 @@ int main(void) {
     CHECK(hstx_active_line(&t720, prefix, alt, sizeof alt, rgb, out, 100) == 0);
     CHECK(hstx_active_line(&t720, prefix, spans, 0, rgb, out, 4096) == 8);   // empty: all black
 
-    // Packed runs: core 0 packs a rendered row, core 1 expands it; every pixel and colour survives.
+    // Packed runs: core 0 packs a rendered row, core 1 expands it; every pixel and colour survives,
+    // read from the table the line was packed against.
     {
-        static uint8_t row[1280], packed[1280 * 4];
+        static uint8_t row[1280], packed[1280 * 2 + 1];
+        static uint32_t other[256];
+        for (int k = 0; k < 256; k++) other[k] = rgb[k] ^ 0x00ffffffu;
+        const uint32_t *const tables[2] = { rgb, other };
         for (int x = 0; x < 1280; x++) row[x] = (uint8_t)(x < 300 ? 7 : x < 301 ? 9 : x < 1000 ? 7 + (x % 2) : 3);
-        uint16_t bytes = hstx_pack_line(row, 1280, rgb, packed, sizeof packed);
-        CHECK(bytes > 0 && bytes % 4 == 0);
-        // 300 px of 7 is one run; 699 alternating pixels are single runs.
-        CHECK(packed[3] == 255 && packed[7] == 43);   // 256 + 44 = 300
-        n = hstx_active_line_packed(&t720, prefix, packed, bytes, out, 4096);
-        CHECK(pixels_in(out, n) == 1280);
-        uint32_t x = 0, i = 6;
-        int colours_ok = 1;
-        while (i < n) {
-            uint32_t count = out[i] & 0xfff, c = out[i + 1];
-            for (uint32_t k = 0; k < count && x < 1280; k++, x++) if (c != rgb[row[x]]) colours_ok = 0;
-            i += 2;
+        for (uint8_t table = 0; table < 2; table++) {
+            uint16_t bytes = hstx_pack_line(row, 1280, table, packed, sizeof packed);
+            CHECK(bytes > 0 && bytes % 2 == 1 && packed[0] == table);
+            // 300 px of 7 is two runs (256 + 44); 699 alternating pixels are single runs.
+            CHECK(packed[1] == 7 && packed[2] == 255 && packed[3] == 7 && packed[4] == 43);
+            n = hstx_active_line_packed(&t720, prefix, packed, bytes, tables, out, 4096);
+            CHECK(pixels_in(out, n) == 1280);
+            uint32_t x = 0, i = 6;
+            int colours_ok = 1;
+            while (i < n) {
+                uint32_t count = out[i] & 0xfff, c = out[i + 1];
+                for (uint32_t k = 0; k < count && x < 1280; k++, x++) if (c != tables[table][row[x]]) colours_ok = 0;
+                i += 2;
+            }
+            CHECK(colours_ok && x == 1280);
+            CHECK(hstx_active_line_packed(&t720, prefix, packed, bytes, tables, out, 64) == 0);  // no half line
         }
-        CHECK(colours_ok && x == 1280);
-        CHECK(hstx_pack_line(row, 1280, rgb, packed, 100) == 0);                     // too small: nothing
-        CHECK(hstx_active_line_packed(&t720, prefix, packed, bytes, out, 64) == 0);  // no half line
-        CHECK(hstx_active_line_packed(&t720, prefix, packed, 0, out, 64) == 8);      // empty: black
+        CHECK(hstx_pack_line(row, 1280, 0, packed, 100) == 0);                            // too small: nothing
+        CHECK(hstx_active_line_packed(&t720, prefix, packed, 0, tables, out, 64) == 8);   // empty: black
     }
 
     if (failures) { printf("%d failure(s)\n", failures); return 1; }

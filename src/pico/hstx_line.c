@@ -66,17 +66,16 @@ uint32_t HSTX_RAM hstx_active_line(const hstx_timing_t *t, const uint32_t prefix
     return n;
 }
 
-uint16_t hstx_pack_line(const uint8_t *px, uint16_t width, const uint32_t *rgb, uint8_t *out, uint16_t max) {
+uint16_t hstx_pack_line(const uint8_t *px, uint16_t width, uint8_t table, uint8_t *out, uint16_t max) {
+    if (max < 1u) return 0;
     uint32_t n = 0, x = 0;
+    out[n++] = table & 1u;
     while (x < width) {
         uint8_t idx = px[x];
         uint32_t run = 1;
         while (run < 256u && x + run < width && px[x + run] == idx) run++;
-        if (n + 4u > max) return 0;
-        uint32_t c = rgb[idx] & 0xffffffu;
-        out[n++] = (uint8_t)c;
-        out[n++] = (uint8_t)(c >> 8);
-        out[n++] = (uint8_t)(c >> 16);
+        if (n + 2u > max) return 0;
+        out[n++] = idx;
         out[n++] = (uint8_t)(run - 1u);
         x += run;
     }
@@ -84,19 +83,20 @@ uint16_t hstx_pack_line(const uint8_t *px, uint16_t width, const uint32_t *rgb, 
 }
 
 uint32_t HSTX_RAM hstx_active_line_packed(const hstx_timing_t *t, const uint32_t prefix[6], const uint8_t *runs, uint32_t len,
-                                          uint32_t *out, uint32_t max) {
+                                          const uint32_t *const tables[2], uint32_t *out, uint32_t max) {
     const uint32_t width = t->h_active;
     if (max < 8u) return 0;
     uint32_t n = 0;
     for (uint32_t k = 0; k < 6u; k++) out[n++] = prefix[k];
     uint32_t x = 0;
     const uint32_t limit = max - 2u;   // room for the padding pair
-    for (uint32_t i = 0; i + 3u < len && x < width; i += 4u) {
-        uint32_t run = (uint32_t)runs[i + 3] + 1u;
+    const uint32_t *rgb = len ? tables[runs[0] & 1u] : 0;
+    for (uint32_t i = 1; i + 1u < len && x < width; i += 2u) {
+        uint32_t run = (uint32_t)runs[i + 1] + 1u;
         if (run > width - x) run = width - x;
         if (n + 2u > limit) return 0;
         out[n++] = HSTX_CMD_TMDS_REPEAT | run;
-        out[n++] = (uint32_t)runs[i] | (uint32_t)runs[i + 1] << 8 | (uint32_t)runs[i + 2] << 16;
+        out[n++] = rgb[runs[i]];
         x += run;
     }
     if (x < width) {
