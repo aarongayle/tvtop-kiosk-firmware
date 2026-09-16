@@ -27,7 +27,7 @@ The Pico's USB port is a serial console (115200 8N1, any terminal program). Comm
 | `stats` | the numbers only |
 | `wifi <ssid> [password]` | store credentials (quote an SSID with spaces: `wifi "My Net" pass`) and reconnect |
 | `server <url>` | store the server base URL, e.g. `server http://192.168.1.10:8080` |
-| `mode 720p30\|720p30rb\|480p60` | store the video mode and reboot |
+| `mode 720p30\|720p30rb\|480p60\|720x480p60\|960x540p60\|1066x600p50` | store the video mode and reboot |
 | `reset` | forget the token, device id and cached URL: the kiosk registers as a new device |
 | `factory` | forget everything and reboot into the setup network |
 | `test` | draw the built-in test pattern |

@@ -50,6 +50,10 @@ struct dvi_inst {
 	queue_t q_colour_valid;
 	queue_t q_colour_free;
 
+	// TV-Top instrumentation (not upstream). Cumulative, never reset:
+	uint32_t stat_missed_lines;    // active scanlines sent as the solid red fallback
+	uint32_t stat_dropped_lines;   // late buffers discarded to get back in step
+	uint32_t stat_irq_max_cycles;  // worst DMA IRQ handler time, SysTick cycles on the IRQ core
 };
 
 // Set up data structures and hardware for DVI.

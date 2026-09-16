@@ -38,6 +38,11 @@ void geom_store_set_id(geom_store_t *g, const char *static_id) {
     if (g->writing) geom_copy_id(g->wr_id, static_id);
 }
 
+void geom_store_set_resolution(geom_store_t *g, uint16_t w, uint16_t h) {
+    g->res_wh = (uint32_t)w << 16 | h;
+    if (g->open && g->res_wh && g->set_wh != g->res_wh) g->open = false;
+}
+
 bool geom_store_is_open(const geom_store_t *g) { return g->open; }
 const char *geom_store_id(const geom_store_t *g) { return g->present ? g->id : ""; }
 uint16_t geom_store_count(const geom_store_t *g) { return g->open ? g->ndefs : 0; }

@@ -111,7 +111,7 @@ void geom_store_abort(geom_store_t *g) {
 static void header_page(const geom_store_t *g, uint32_t p, uint8_t *out) {
     // Only the fixed fields are assembled here (the index is copied straight from the scratch),
     // so this needs a few dozen bytes of stack rather than a whole 6 KB header.
-    struct { uint32_t magic, version; char static_id[KIOSK_MAX_STATIC_ID]; uint32_t ndefs, data_len, data_crc32; } fixed;
+    struct { uint32_t magic, version; char static_id[KIOSK_MAX_STATIC_ID]; uint32_t ndefs, data_len, data_crc32, out_wh; } fixed;
     _Static_assert(sizeof fixed == offsetof(geom_flash_hdr_t, index), "fixed header fields must match geom_flash_hdr_t");
     memset(&fixed, 0, sizeof fixed);
     fixed.magic = GEOM_HDR_MAGIC;
@@ -120,6 +120,7 @@ static void header_page(const geom_store_t *g, uint32_t p, uint8_t *out) {
     fixed.ndefs = g->wr_ndefs;
     fixed.data_len = impl.data_len;
     fixed.data_crc32 = impl.crc;
+    fixed.out_wh = g->res_wh;
     const size_t index_off = offsetof(geom_flash_hdr_t, index);
     memset(out, 0xFF, GEOM_FLASH_PAGE);
     for (uint32_t i = 0; i < GEOM_FLASH_PAGE; i++) {
@@ -150,6 +151,7 @@ bool geom_store_commit(geom_store_t *g) {
     g->rd_data_begin = GEOM_FLASH_HDR_BYTES;
     g->rd_data_end = GEOM_FLASH_HDR_BYTES + impl.data_len;
     g->ndefs = g->wr_ndefs;
+    g->set_wh = g->res_wh;
     memcpy(g->id, g->wr_id, sizeof g->id);
     g->present = true;
     g->open = true;
@@ -174,6 +176,7 @@ static bool load_header(geom_store_t *g) {
     g->rd_data_begin = GEOM_FLASH_HDR_BYTES;
     g->rd_data_end = GEOM_FLASH_HDR_BYTES + h->data_len;
     g->ndefs = (uint16_t)h->ndefs;
+    g->set_wh = h->out_wh;
     memcpy(g->id, h->static_id, sizeof g->id);
     g->id[KIOSK_MAX_STATIC_ID - 1] = 0;
     return true;
@@ -183,7 +186,7 @@ bool geom_store_open(geom_store_t *g, const char *static_id) {
     if (g->writing) { g->open = false; return false; }
     if (!g->present) g->present = load_header(g);
     g->open = g->present && static_id && strncmp(g->id, static_id, KIOSK_MAX_STATIC_ID) == 0
-              && strlen(static_id) < KIOSK_MAX_STATIC_ID;
+              && strlen(static_id) < KIOSK_MAX_STATIC_ID && (g->res_wh == 0 || g->set_wh == g->res_wh);
     return g->open;
 }
 
