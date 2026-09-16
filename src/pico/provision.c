@@ -617,7 +617,7 @@ static void console_exec(char *line) {
     } else if (strcmp(cmd, "status") == 0) {
         print_status();
     } else if (strcmp(cmd, "stats") == 0) {
-        char buf[256];
+        char buf[512];   // 256 cut the video line off
         kiosk_loop_status(buf, sizeof buf);
         printf("%s\n", buf);
 #ifndef PROVISION_HOST_TEST

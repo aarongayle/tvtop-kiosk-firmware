@@ -3,7 +3,7 @@
 #pragma once
 #include <stdint.h>
 
-#define KIOSK_FW_VERSION "0.1.0"
+#define KIOSK_FW_VERSION "0.2.0"   // 0.2.0: frames may declare their canvas (w/h), e.g. 1920×1080
 #ifndef KIOSK_MODEL
 #define KIOSK_MODEL "pico-w" // CMake sets it from PICO_BOARD (pico-w, pico2-w); this covers host builds
 #endif
@@ -91,8 +91,8 @@
 
 // Line pool encoding: each scanline is (index, run-1) byte pairs, runs of 1..256 pixels.
 #if KIOSK_HSTX
-// HSTX lines are packed runs, four bytes each (hstx_line.h): a line of single pixels is 4 KB.
-#define LINE_MAX_BYTES (OUT_MAX_W * 4)
+// HSTX lines are a table byte and then the same pairs (hstx_line.h).
+#define LINE_MAX_BYTES (OUT_MAX_W * 2 + 1)
 #else
 #define LINE_MAX_BYTES (OUT_MAX_W * 2)
 #endif

@@ -41,13 +41,18 @@ void hstx_line_prefix(const hstx_timing_t *t, bool vsync, uint32_t prefix[6]);
 // A whole blanking line (the prefix with the back porch extended over the active width). 6 words.
 uint32_t hstx_blank_line(const hstx_timing_t *t, bool vsync, uint32_t *out);
 
-// Packed runs: the line-pool format on the RP2350. Each run is four bytes, little-endian
-// 0xLLRRGGBB: LL is the run length minus one (so 1..256 pixels) and RRGGBB its exact colour. Core 0
-// packs them while rendering (the palette lookup happens there, once); core 1 then turns each run into
-// two HSTX words with a shift and a mask, which keeps up with the densest 720p line.
-uint16_t hstx_pack_line(const uint8_t *px, uint16_t width, const uint32_t *rgb, uint8_t *out, uint16_t max);
+// Packed runs: the line-pool format on the RP2350. Byte 0 says which of two colour tables the line
+// was packed against; then each run is two bytes, (palette index, run length - 1), so 1..256 pixels.
+// Core 1 turns each run into two HSTX words with one table read.
+//
+// Two bytes a run rather than four (the exact colour inline) halves the pool a frame needs: a
+// detailed 1080p board did not fit in 256 KB at four bytes, and a line that does not fit is drawn as
+// a copy of the one above it. The table byte is what makes indices safe: when the palette resets,
+// new lines are packed against the other table, and lines of the previous frame still on screen
+// keep reading the colours they were packed with.
+uint16_t hstx_pack_line(const uint8_t *px, uint16_t width, uint8_t table, uint8_t *out, uint16_t max);
 uint32_t hstx_active_line_packed(const hstx_timing_t *t, const uint32_t prefix[6], const uint8_t *runs, uint32_t len,
-                                 uint32_t *out, uint32_t max);
+                                 const uint32_t *const tables[2], uint32_t *out, uint32_t max);
 
 // An active line: `prefix` (from hstx_line_prefix) then TMDS commands for (index, run-1) spans,
 // colours looked up in rgb[256]. Runs of two or more pixels become TMDS_REPEAT; consecutive single

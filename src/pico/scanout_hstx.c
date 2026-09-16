@@ -40,8 +40,16 @@ static hstx_timing_t g_timing;
 static linepool_t *g_pool;
 static uint32_t g_sys_khz;
 
-// Palette index -> 0x00RRGGBB. Core 0 writes an entry before any published line uses it.
-static uint32_t g_rgb[256];
+// Palette index -> 0x00RRGGBB, in two tables. Core 0 writes an entry before any published line uses
+// it. Each line names the table it was packed against; a palette reset moves new lines to the other
+// table, so the previous frame's lines still on screen keep their colours until they are replaced.
+static uint32_t g_tables[2][256];
+// Not const: core 1 reads this for every line, and a const array lands in flash, which stops
+// answering while core 0 writes the config or the geometry cache. Everything core 1 touches is RAM.
+static const uint32_t *g_table_ptrs[2] = { g_tables[0], g_tables[1] };
+static uint8_t g_table;
+static uint16_t g_generation;
+#define g_rgb (g_tables[g_table])
 
 static uint32_t g_blank_vsync[6], g_blank[6], g_prefix[6];
 static uint32_t g_black[8];
@@ -173,16 +181,24 @@ void scanout_set_entry(uint8_t idx, uint32_t rgb) { g_rgb[idx] = rgb & 0xffffffu
 static palette_t *g_pal;
 
 void scanout_upload_palette(palette_t *pal) {
+    uint16_t from = pal->dirty_from;
+    if (g_pal != NULL && pal->generation != g_generation) {
+        // Reset: indices now mean other colours. Fill the other table from scratch and pack new lines
+        // against it; the old table stays intact for the lines still showing the previous frame.
+        g_table ^= 1u;
+        from = 0;
+    }
     g_pal = pal;
-    for (uint16_t i = pal->dirty_from; i < pal->count; i++) g_rgb[i] = pal->rgb[i] & 0xffffffu;
+    g_generation = pal->generation;
+    for (uint16_t i = from; i < pal->count; i++) g_rgb[i] = pal->rgb[i] & 0xffffffu;
     pal->dirty_from = pal->count;
 }
 
 uint16_t scanout_encode_line(const uint8_t *px, uint16_t width, uint8_t *out, uint16_t max) {
-    // Colours added while rendering (blends, anti-aliased edges) must be in the table before they are
-    // packed: the packed run carries the colour itself, not the index.
-    if (g_pal && g_pal->dirty_from < g_pal->count) scanout_upload_palette(g_pal);
-    return hstx_pack_line(px, width, g_rgb, out, max);
+    // Colours added while rendering (blends, anti-aliased edges) must be in the table before a line
+    // that uses them is published.
+    if (g_pal && (g_pal->dirty_from < g_pal->count || g_pal->generation != g_generation)) scanout_upload_palette(g_pal);
+    return hstx_pack_line(px, width, g_table, out, max);
 }
 
 // ---------------- Core 1 ----------------
@@ -242,7 +258,7 @@ static void __not_in_flash_func(build_line)(int slot, uint16_t y) {
     uint32_t t0 = timer_hw->timerawl;
     const uint8_t *spans = (ref.flags & LINE_FLAG_DUP_PREV) ? 0 : g_pool->pool + ref.off;
     uint32_t len = spans ? ref.len : 0u;
-    uint32_t n = hstx_active_line_packed(&g_timing, g_prefix, spans, len, g_words[slot], LINE_WORDS);
+    uint32_t n = hstx_active_line_packed(&g_timing, g_prefix, spans, len, g_table_ptrs, g_words[slot], LINE_WORDS);
     linepool_reader_done(g_pool);
     uint32_t dt = timer_hw->timerawl - t0;
     if (dt > stat_worst_us) { stat_worst_us = dt; stat_worst_y = y; stat_worst_len = len; }
