@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const int SIZES[] = { 10, 12, 13, 14, 16, 19, 22, 24, 26 };
+static const int SIZES[] = { 7, 8, 9, 10, 11, 12, 13, 14, 16, 19, 22, 24, 26 };   // 7-11 px: 13-19 px board text scaled to 720x480
 #define NSIZES ((int)(sizeof SIZES / sizeof SIZES[0]))
 #define NWEIGHTS 2
 #define LARGE_MIN 22

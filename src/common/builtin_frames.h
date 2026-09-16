@@ -9,6 +9,8 @@ typedef enum {
     BUILTIN_REGISTERING,   // no args
     BUILTIN_NO_TLS,        // arg1 = the https URL we cannot fetch
     BUILTIN_TEST_PATTERN,  // colour bars + text, for bring-up
+    BUILTIN_SOLID,         // three flat colour bands, no text: near-zero encode cost (signal-integrity check)
+    BUILTIN_LABEL,         // the same bands with arg1 in large type (signal sweep step labels)
 } builtin_frame_t;
 
 // Writes a complete frame JSON into buf (NUL-terminated). Args are JSON-escaped. Returns length,

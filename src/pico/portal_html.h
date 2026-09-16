@@ -30,15 +30,21 @@ static const char portal_html[] =
 "<label for=server>Kiosk server</label>"
 "<input id=server name=server maxlength=255 placeholder='https://kiosk.tvtop.games'>"
 "<label for=mode>Video mode</label>"
-"<select id=mode name=mode><option value=720p30>1280x720 30 Hz</option>"
+#if KIOSK_HSTX
+"<select id=mode name=mode><option value=720p60>1280x720 60 Hz</option><option value=960x540p60>960x540 60 Hz</option><option value=480p60>640x480 60 Hz</option><option value=1080p30>1920x1080 30 Hz</option><option value=1080p25>1920x1080 25 Hz (TV)</option><option value=1080p24>1920x1080 24 Hz (TV)</option></select>"
+#else
+"<select id=mode name=mode><option value=960x540p60>960x540 60 Hz</option><option value=1066x600p50>1066x600 50 Hz</option>"
+"<option value=720x480p60>720x480 60 Hz</option>"
+"<option value=720p30>1280x720 30 Hz</option>"
 "<option value=720p30rb>1280x720 30 Hz (reduced blanking)</option>"
 "<option value=480p60>640x480 60 Hz</option></select>"
+#endif
 "<button class=p type=submit>Save and reboot</button>"
 "<div id=msg></div></form></main>"
 "<script>"
 "var $=function(i){return document.getElementById(i)};"
 "fetch('/config.json').then(function(r){return r.json()}).then(function(c){"
-"$('ssid').value=c.ssid||'';$('server').value=c.server||'';$('mode').value=c.mode||'720p30';"
+"$('ssid').value=c.ssid||'';$('server').value=c.server||'';var m=$('mode');if(c.mode&&![].some.call(m.options,function(o){return o.value==c.mode})){var o=document.createElement('option');o.value=o.textContent=c.mode;m.appendChild(o)}if(c.mode)m.value=c.mode;"
 "$('sub').textContent='Kiosk '+c.ap+' \\u00b7 firmware '+c.fw;}).catch(function(){});"
 "var polls=0;function poll(){fetch('/scan').then(function(r){return r.json()}).then(function(l){"
 "var d=$('nets');d.innerHTML='';l.sort(function(a,b){return b.rssi-a.rssi}).forEach(function(n){"

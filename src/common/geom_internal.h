@@ -18,7 +18,7 @@
 
 // Flash header (also the on-disk layout the host test checks). 'KGEO' as little-endian bytes.
 #define GEOM_HDR_MAGIC 0x4F45474Bu
-#define GEOM_HDR_VERSION 2u
+#define GEOM_HDR_VERSION 3u   // 3: header carries the output resolution the set was decoded for
 #define GEOM_FLASH_HDR_BYTES 8192u
 #define GEOM_FLASH_PAGE 256u
 #define GEOM_FLASH_BLOCK 65536u
@@ -31,6 +31,7 @@ typedef struct {
     uint32_t ndefs;
     uint32_t data_len;                 // bytes of records after the header
     uint32_t data_crc32;               // crc32_update(0, region + GEOM_FLASH_HDR_BYTES, data_len)
+    uint32_t out_wh;                   // width << 16 | height the records were scaled to (0 = unknown)
     uint32_t index[KIOSK_MAX_DEFS];    // byte offset of each record's trailer from the region start, GEOM_ABSENT if none
 } geom_flash_hdr_t;
 
@@ -47,8 +48,10 @@ struct geom_store {
 
     // ---- committed set (readable) ----
     bool present;                     // a complete set exists
-    bool open;                        // geom_store_open matched the set's id
+    bool open;                        // geom_store_open matched the set's id and resolution
     char id[KIOSK_MAX_STATIC_ID];
+    uint32_t set_wh;                  // resolution the committed set was decoded for
+    uint32_t res_wh;                  // resolution the device renders at (geom_store_set_resolution), 0 = any
     uint16_t ndefs;
     const uint8_t *rd_base;           // record trailer at rd_base + rd_index[id]
     const uint32_t *rd_index;

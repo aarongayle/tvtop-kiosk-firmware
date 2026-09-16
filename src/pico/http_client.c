@@ -18,6 +18,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifndef KIOSK_MODEL
+#define KIOSK_MODEL "pico-w" // CMake sets it from PICO_BOARD; this covers the host test build
+#endif
+
 #ifdef HTTP_CLIENT_STANDALONE_TEST
 // host/tests/test_http.c includes this file and implements a fake lwIP behind these declarations
 // (same names and semantics as the real ones, see the SDK headers listed in docs/NETWORK.md).
@@ -345,12 +349,12 @@ static bool send_request_locked(http_client_t *c) {
     bool default_port = c->port == (c->https ? 443 : 80);
     if (default_port)
         n = snprintf(req, sizeof req,
-                     "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: tvtop-kiosk/" KIOSK_FW_VERSION " (pico-w)\r\n"
+                     "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: tvtop-kiosk/" KIOSK_FW_VERSION " (" KIOSK_MODEL ")\r\n"
                      "Accept: application/json\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n\r\n",
                      c->path, c->host);
     else
         n = snprintf(req, sizeof req,
-                     "GET %s HTTP/1.1\r\nHost: %s:%u\r\nUser-Agent: tvtop-kiosk/" KIOSK_FW_VERSION " (pico-w)\r\n"
+                     "GET %s HTTP/1.1\r\nHost: %s:%u\r\nUser-Agent: tvtop-kiosk/" KIOSK_FW_VERSION " (" KIOSK_MODEL ")\r\n"
                      "Accept: application/json\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n\r\n",
                      c->path, c->host, (unsigned)c->port);
     if (n <= 0 || n >= (int)sizeof req) return false;

@@ -11,7 +11,7 @@
 // What board.h would provide.
 typedef enum { VIDEO_720P30 = 0, VIDEO_720P30_RB = 1, VIDEO_480P60 = 2, VIDEO_MODE_COUNT } video_mode_t;
 typedef struct { const char *name; } video_mode_info_t;
-static const video_mode_info_t modes[3] = { { "720p30" }, { "720p30rb" }, { "480p60" } };
+static const video_mode_info_t modes[6] = { { "720p30" }, { "720p30rb" }, { "480p60" }, { "720x480p60" }, { "960x540p60" }, { "1066x600p50" } };
 const video_mode_info_t *video_mode_info(video_mode_t m) { return &modes[m < 3 ? m : 0]; }
 video_mode_t video_mode_from_name(const char *name) {
     for (int i = 0; i < 3; i++) if (strcmp(modes[i].name, name) == 0) return (video_mode_t)i;

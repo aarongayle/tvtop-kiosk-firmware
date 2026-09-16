@@ -22,7 +22,7 @@ error. Responses:
 |---|---|
 | 200 | decode + draw; follow `next_url`; persist it if its shape changed |
 | 304 | nothing changed; ask again after a 250 ms floor |
-| 404 | unknown/unpaired: go to `/v1/config?t=<token>` |
+| 404 | from a frame URL: go to `/v1/config?t=<token>`. From `/v1/config` itself three times in a row: the server no longer knows the token (registry reset, kiosk deleted), so forget it and register again, showing a new pairing code |
 | other / error / timeout | keep the last frame; exponential backoff 1 s → 60 s with full jitter; after 2 failures overlay the offline badge |
 
 `next_ms` is treated as the failsafe the protocol describes: requests are free, so the client

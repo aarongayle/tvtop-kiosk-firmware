@@ -90,6 +90,22 @@ size_t builtin_frame_json(builtin_frame_t which, char *buf, size_t cap, const ch
             "[\"t\",640,500,\"or build the firmware with -DKIOSK_TLS=ON\",28,\"" DIM "\",1]"
             "]}", a1);
         break;
+    case BUILTIN_SOLID:
+        // Three wide bands and nothing else: every line is one to three runs, so the encoder is
+        // idle most of each scanline. If a display drops out on this, the cause is the signal or
+        // the clock, not encoding speed.
+        n = snprintf(buf, cap,
+            "{\"v\":3,\"next_url\":null,\"next_ms\":0,\"w\":1280,\"h\":720,\"bg\":\"#1e50b4\",\"ops\":["
+            "[\"r\",0,240,1280,240,\"#f0f0f0\"],[\"r\",0,480,1280,240,\"#20a040\"]"
+            "]}");
+        break;
+    case BUILTIN_LABEL:
+        n = snprintf(buf, cap,
+            "{\"v\":3,\"next_url\":null,\"next_ms\":0,\"w\":1280,\"h\":720,\"bg\":\"#1e50b4\",\"ops\":["
+            "[\"r\",0,240,1280,240,\"#f0f0f0\"],[\"r\",0,480,1280,240,\"#20a040\"],"
+            "[\"t\",640,160,\"%s\",96,\"#ffffff\",1,1]"
+            "]}", a1);
+        break;
     case BUILTIN_TEST_PATTERN: {
         // Colour bars across the top half, a grey ramp below, a 1 px border for overscan checks.
         static const char *bars[8] = { "#ffffff", "#ffff00", "#00ffff", "#00ff00", "#ff00ff", "#ff0000", "#0000ff", "#000000" };

@@ -23,7 +23,7 @@ extern uint32_t host_now_ms;
 int host_video_mode_from_name(const char *name);
 #define CONFIG_FLASH_PTR() (host_flash_sector)
 #define VIDEO_MODE_FROM_NAME(n) ((uint8_t)host_video_mode_from_name(n))
-#define VIDEO_MODE_LIMIT 3
+#define VIDEO_MODE_LIMIT 6
 #define FLASH_PAGE_SIZE 256u
 #define FLASH_SECTOR_SIZE 4096u
 #ifndef PICO_FLASH_SIZE_BYTES
@@ -37,6 +37,7 @@ static uint32_t now_ms(void) { return host_now_ms; }
 #include "hardware/xip_cache.h"
 #include "pico/time.h"
 #include "board.h"
+#include "hardware/watchdog.h"
 #define CONFIG_FLASH_PTR() flash_store_ptr(KIOSK_CONFIG_FLASH_OFFSET)
 #define VIDEO_MODE_FROM_NAME(n) ((uint8_t)video_mode_from_name(n))
 #define VIDEO_MODE_LIMIT ((uint8_t)VIDEO_MODE_COUNT)
@@ -181,15 +182,29 @@ static void raw_program(uint32_t offset, const uint8_t *data, size_t len) {
 }
 static bool in_sram(const void *p) { (void)p; return true; }
 #else
-static void raw_erase(uint32_t offset, size_t len) {
+#if KIOSK_HSTX
+// scanout_hstx.c: the ROM routines behind erase and program re-enter XIP with slow default timing.
+void scanout_flash_timing_restore(void);
+#define KIOSK_FLASH_TIMING_RESTORE() scanout_flash_timing_restore()
+// Until the timing is reapplied, the flash may be running with the ROM's defaults, which are not
+// guaranteed at 372 MHz: nothing between the ROM call and the restore may execute from flash.
+#define KIOSK_FLASH_WRAPPER(name) __no_inline_not_in_flash_func(name)
+#else
+#define KIOSK_FLASH_TIMING_RESTORE() ((void)0)
+#define KIOSK_FLASH_WRAPPER(name) name
+#endif
+
+static void KIOSK_FLASH_WRAPPER(raw_erase)(uint32_t offset, size_t len) {
     uint32_t s = save_and_disable_interrupts();
     flash_range_erase(offset, len);
+    KIOSK_FLASH_TIMING_RESTORE();
     restore_interrupts(s);
     xip_cache_invalidate_all();
 }
-static void raw_program(uint32_t offset, const uint8_t *data, size_t len) {
+static void KIOSK_FLASH_WRAPPER(raw_program)(uint32_t offset, const uint8_t *data, size_t len) {
     uint32_t s = save_and_disable_interrupts();
     flash_range_program(offset, data, len);
+    KIOSK_FLASH_TIMING_RESTORE();
     restore_interrupts(s);
     xip_cache_invalidate_all();
 }
@@ -205,7 +220,15 @@ void flash_store_erase(uint32_t offset, size_t len) {
     if ((offset & (FLASH_SECTOR_SIZE - 1)) != 0 || len == 0) return;
     len = (len + FLASH_SECTOR_SIZE - 1) & ~(size_t)(FLASH_SECTOR_SIZE - 1);
     if (offset >= PICO_FLASH_SIZE_BYTES || len > PICO_FLASH_SIZE_BYTES - offset) return;
-    raw_erase(offset, len);
+    // One 4 KB sector per interrupts-off window (~40 ms) instead of a 64 KB block erase (hundreds of
+    // ms). The Wi-Fi driver runs from core-0 interrupts, and long gaps in servicing it were one
+    // suspect for the radio wedging right after a board's geometry was written.
+    for (size_t done = 0; done < len; done += FLASH_SECTOR_SIZE) {
+        raw_erase(offset + (uint32_t)done, FLASH_SECTOR_SIZE);
+#ifndef FLASH_STORE_HOST_TEST
+        watchdog_update();
+#endif
+    }
 }
 
 void flash_store_program(uint32_t offset, const uint8_t *data, size_t len) {

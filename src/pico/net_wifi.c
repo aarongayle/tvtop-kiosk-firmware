@@ -62,6 +62,8 @@ bool net_wifi_init(void) {
     // not specified above that. We run clk_sys at up to 372 MHz (the TMDS bit clock), so pick the
     // smallest integer divider that keeps the SPI at or below 31.25 MHz: ceil(clk_sys / 62.5 MHz).
     uint32_t hz = clock_get_hz(clk_sys);
+    // Keep the PIO clock at the stock ~62.5 MHz. The SDK's default SPI program (spi_gap01_sample0)
+    // samples for that speed: halving the divider's output made the chip fail to start at all.
     uint32_t div = (hz + 62500000u - 1u) / 62500000u;
     if (div < 2) div = 2;
     cyw43_set_pio_clkdiv_int_frac8(div, 0);
@@ -183,6 +185,14 @@ const char *net_wifi_ip(char *buf, size_t cap) {
     return buf;
 }
 
+// The 2.4 GHz channel the station is on (1-14), or 0 if unknown. Channel spacing decides which DVI
+// clock harmonics land inside it.
+int net_wifi_channel(void) {
+    uint8_t buf[12] = {0};   // channel_info_t: hw_channel, target_channel, scan_channel (LE u32)
+    if (cyw43_ioctl(&cyw43_state, CYW43_IOCTL_GET_CHANNEL, sizeof buf, buf, CYW43_ITF_STA) != 0) return 0;
+    return (int)(buf[0] | buf[1] << 8);
+}
+
 int net_wifi_rssi(void) {
     if (!initted || state != WIFI_UP) return 0;
     int32_t rssi = 0;
@@ -242,4 +252,9 @@ void net_wifi_led(bool on) {
 #else
     (void)on;
 #endif
+}
+
+void net_wifi_smps_pwm(bool pwm) {
+    if (!initted) return;
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_SMPS_PIN, pwm);
 }

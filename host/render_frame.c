@@ -11,6 +11,7 @@
 #include "font.h"
 #include "linepool.h"
 #include "icons.h"
+#include "tmds_wr.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
@@ -24,7 +25,10 @@ typedef struct {
     uint8_t *img; uint16_t w, h;
     uint32_t pool_bytes, max_line, max_line_y, lines;
     uint8_t rle[LINE_MAX_BYTES];
+    uint32_t wr_bytes, wr_max_line, wr_max_line_y, wr_over[4];   // device scanline format: bytes; lines over 1/2/4/8 KB... (unused)
 } sink_t;
+
+static wr_ctx_t g_wr;   // the device's word-run scanline encoder, fed the same palette
 
 static void sink(void *ctx, uint16_t y, const uint8_t *px, uint16_t width) {
     sink_t *s = ctx;
@@ -32,6 +36,10 @@ static void sink(void *ctx, uint16_t y, const uint8_t *px, uint16_t width) {
     uint16_t n = rle_encode_line(px, width, s->rle, sizeof s->rle);
     s->pool_bytes += n;
     if (n > s->max_line) { s->max_line = n; s->max_line_y = y; }
+    for (uint16_t i = 0; i < g_pal.count; i++) wr_set_colour(&g_wr, (uint8_t)i, g_pal.rgb[i]);
+    uint16_t m = wr_line_from_pixels(&g_wr, px, width, s->rle, sizeof s->rle);
+    s->wr_bytes += m;
+    if (m > s->wr_max_line) { s->wr_max_line = m; s->wr_max_line_y = y; }
     s->lines++;
 }
 
@@ -80,6 +88,7 @@ static frame_status_t decode(const char *path, geom_store_t *geom, uint16_t w, u
 }
 
 int main(int argc, char **argv) {
+    wr_init(&g_wr);
     const char *in = NULL, *out = NULL, *stat = NULL;
     uint16_t w = OUT_MAX_W, h = OUT_MAX_H;
     size_t chunk = 1000;
@@ -146,6 +155,7 @@ int main(int argc, char **argv) {
                g_pal.count, distinct, g_frame.npaints, g_frame.static_id[0] ? g_frame.static_id : "-",
                geom_store_is_open(geom) ? geom_store_count(geom) : 0,
                s.pool_bytes, s.max_line, s.max_line_y, rs.spans, rs.edge_visits, decode_ms, render_ms, s.lines);
+        printf("device scanline format (word runs, WR_RUN_MIN %d): %u bytes, longest line %u bytes at y%u; colour pairs %u of %u, table-full fallbacks %u\n", WR_RUN_MIN, s.wr_bytes, s.wr_max_line, s.wr_max_line_y, (unsigned)(g_wr.next_id - WR_PURE_IDS), (unsigned)(WR_IDS - WR_PURE_IDS), (unsigned)g_wr.stats_table_full);
     }
     return 0;
 }

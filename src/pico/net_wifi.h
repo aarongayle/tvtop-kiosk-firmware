@@ -12,9 +12,12 @@ void net_wifi_connect(const char *ssid, const char *password);   // async; poll 
 wifi_state_t net_wifi_state(void);
 const char *net_wifi_ip(char *buf, size_t cap);   // dotted quad or "" when not up
 int net_wifi_rssi(void);
+int net_wifi_channel(void);
 // SoftAP for provisioning (open network). Returns the SSID used ("TVTOP-xxxx", from the unique id).
 const char *net_wifi_start_ap(void);
 void net_wifi_stop_ap(void);
 void net_wifi_led(bool on);
+// Pico W 3V3 regulator mode: true forces PWM (quieter rail), false restores power-save.
+void net_wifi_smps_pwm(bool pwm);
 // Call from the main loop (drives reconnect attempts / state transitions).
 void net_wifi_poll(void);

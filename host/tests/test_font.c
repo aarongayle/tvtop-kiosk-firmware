@@ -20,7 +20,7 @@ static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 // Must match tools/fontgen/fontgen.c.
-static const int SIZES[] = { 10, 12, 13, 14, 16, 19, 22, 24, 26 };
+static const int SIZES[] = { 7, 8, 9, 10, 11, 12, 13, 14, 16, 19, 22, 24, 26 };
 #define NSIZES ((int)(sizeof SIZES / sizeof SIZES[0]))
 #define LARGE_MIN 22
 
@@ -144,11 +144,11 @@ static void test_size_selection(void) {
     CHECK(font_bitmap_size_for(21) == 22, "21 -> %d", font_bitmap_size_for(21));
     CHECK(font_bitmap_size_for(23) == 24, "23 -> %d (ties up)", font_bitmap_size_for(23));
     CHECK(font_bitmap_size_for(25) == 26, "25 -> %d (ties up)", font_bitmap_size_for(25));
-    CHECK(font_bitmap_size_for(11) == 12, "11 -> %d (ties up)", font_bitmap_size_for(11));
+    CHECK(font_bitmap_size_for(11) == 11, "11 -> %d (exact since the 720x480 sizes)", font_bitmap_size_for(11));
     CHECK(font_bitmap_size_for(15) == 16, "15 -> %d (ties up)", font_bitmap_size_for(15));
     CHECK(font_bitmap_size_for(17) == 16, "17 -> %d (nearest)", font_bitmap_size_for(17));
-    CHECK(font_bitmap_size_for(9) == 10, "9 -> %d", font_bitmap_size_for(9));
-    CHECK(font_bitmap_size_for(1) == 10, "1 -> %d", font_bitmap_size_for(1));
+    CHECK(font_bitmap_size_for(9) == 9, "9 -> %d", font_bitmap_size_for(9));
+    CHECK(font_bitmap_size_for(1) == 7, "1 -> %d (smallest face)", font_bitmap_size_for(1));
     for (int i = 0; i < NSIZES; i++)
         CHECK(font_bitmap_size_for(SIZES[i]) == SIZES[i], "exact %d -> %d", SIZES[i], font_bitmap_size_for(SIZES[i]));
     // Snapping affects metrics: 17 px measures with the 16 px face, 18 px with the 19 px face.
