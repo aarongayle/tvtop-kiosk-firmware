@@ -61,7 +61,8 @@ static void on_message(uint8_t type, const uint8_t *p, uint16_t len) {
         if (1u + sl > len || sl > 31) return;
         char ssid[32];
         memcpy(ssid, p + 1, sl); ssid[sl] = 0;
-        net_ap_start(ssid);
+        bool keep_station = 1u + sl < len && p[1 + sl] != 0;
+        net_ap_start(ssid, keep_station);
         portal_enable(true);
         return;
     }
@@ -109,6 +110,15 @@ static void on_message(uint8_t type, const uint8_t *p, uint16_t len) {
         if (len < 2) return;
         portal_close(p[0], p[1] != 0);
         return;
+
+    case H_NET_CHECK: {
+        if (len < 2) return;
+        uint16_t ul;
+        memcpy(&ul, p, 2);
+        if (2u + ul > len) return;
+        httpc_netcheck((const char *)p + 2, ul);
+        return;
+    }
 
     case H_LED:
         return;   // v3 puts the status LED on the RP2354A; nothing to do here

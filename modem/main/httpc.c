@@ -17,6 +17,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "lwip/netdb.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -32,7 +33,10 @@
 #define BODY_CHUNK (MODEM_MAX_PAYLOAD - 1)
 #define URL_MAX 256
 
+typedef enum { REQ_GET, REQ_NETCHECK } req_kind_t;
+
 typedef struct {
+    req_kind_t kind;
     uint8_t id;
     uint32_t timeout_ms;
     uint32_t credit;
@@ -182,11 +186,74 @@ out:
     return err;
 }
 
+// Is this network actually online, or is something answering on its behalf?
+//
+// The probe URL's only correct answer is 204 with no body. A sign-in portal cannot help itself: it
+// returns its login page, or a redirect to it, and that is the whole signal. Redirects are
+// deliberately not followed — following one would turn the giveaway into a 200.
+static void run_netcheck(const req_t *r) {
+    esp_http_client_config_t cfg = {
+        .url = r->url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 5000,
+        .buffer_size = 512,
+        .buffer_size_tx = 512,
+        .disable_auto_redirect = true,
+    };
+    // esp_http_client reports a failed name lookup and a failed connect with the same
+    // ESP_ERR_HTTP_CONNECT, so resolve the host first: "names do not resolve" and "nothing answers"
+    // point at different problems and the screen says different things about them.
+    char host[128] = {0};
+    {
+        const char *h = strstr(r->url, "://");
+        h = h ? h + 3 : r->url;
+        size_t n = strcspn(h, ":/");
+        if (n && n < sizeof host) memcpy(host, h, n);
+    }
+    bool resolved = false;
+    if (host[0]) {
+        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+        struct addrinfo *res = NULL;
+        resolved = getaddrinfo(host, "80", &hints, &res) == 0 && res;
+        if (res) freeaddrinfo(res);
+    }
+    if (!resolved) {
+        uint8_t buf[3] = { MODEM_NET_NO_DNS, 0, 0 };
+        ESP_LOGI(TAG, "net check: no dns (%s did not resolve)", host);
+        link_send(M_NET_CHECK, buf, sizeof buf);
+        return;
+    }
+
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    uint8_t verdict = MODEM_NET_NO_ROUTE;
+    uint16_t status = 0;
+    if (c) {
+        esp_err_t e = esp_http_client_open(c, 0);
+        if (e != ESP_OK) {
+            verdict = MODEM_NET_NO_ROUTE;
+        } else {
+            int64_t cl = esp_http_client_fetch_headers(c);
+            status = (uint16_t)esp_http_client_get_status_code(c);
+            if (status == 204 && cl <= 0) verdict = MODEM_NET_ONLINE;
+            else verdict = MODEM_NET_CAPTIVE;
+        }
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+    }
+    static const char *names[] = { "online", "captive portal", "no dns", "no route" };
+    ESP_LOGI(TAG, "net check: %s (status %u) via %s", names[verdict < 4 ? verdict : 3], status, r->url);
+    uint8_t buf[3];
+    buf[0] = verdict;
+    memcpy(buf + 1, &status, 2);
+    link_send(M_NET_CHECK, buf, sizeof buf);
+}
+
 static void http_task(void *arg) {
     (void)arg;
     req_t r;
     for (;;) {
         if (xQueueReceive(req_q, &r, portMAX_DELAY) != pdTRUE) continue;
+        if (r.kind == REQ_NETCHECK) { run_netcheck(&r); continue; }
         active_id = r.id;
         credit = r.credit;
         cancelled = false;
@@ -199,14 +266,33 @@ static void http_task(void *arg) {
 }
 
 void httpc_init(void) {
+    // A parked long poll is silent for up to 25 s, so every socket slice that expires logs
+    // "Connection timed out before data was ready!" at warning level. That is the steady state
+    // here, not a fault, and at one line every few seconds it would bury everything else on the
+    // kiosk's console. Real failures still come through at error level.
+    esp_log_level_set("HTTP_CLIENT", ESP_LOG_ERROR);
     req_q = xQueueCreate(1, sizeof(req_t));
     credit_sem = xSemaphoreCreateBinary();
     // 6 KB: mbedTLS itself allocates from the heap, but the TLS handshake runs on this stack.
     xTaskCreate(http_task, "http", 6144, NULL, 6, NULL);
 }
 
+void httpc_netcheck(const char *url, uint16_t url_len) {
+    req_t r;
+    memset(&r, 0, sizeof r);
+    r.kind = REQ_NETCHECK;
+    if (url_len >= sizeof r.url) return;
+    memcpy(r.url, url, url_len);
+    r.url[url_len] = 0;
+    // Dropped rather than queued behind a long poll: the kiosk asks again, and a stale verdict is
+    // worse than none.
+    if (xQueueSend(req_q, &r, 0) != pdTRUE) ESP_LOGW(TAG, "net check skipped: busy");
+}
+
 void httpc_get(uint8_t id, uint32_t timeout_ms, uint32_t credit_init, const char *url, uint16_t url_len) {
     req_t r;
+    memset(&r, 0, sizeof r);
+    r.kind = REQ_GET;
     if (url_len >= sizeof r.url) { done(id, MODEM_HTTP_ERR_URL, 0); return; }
     memcpy(r.url, url, url_len);
     r.url[url_len] = 0;

@@ -41,7 +41,10 @@ enum {
     H_PING          = 0x02,   // —
     H_WIFI_CONNECT  = 0x10,   // u8 ssid_len, ssid, u8 pass_len, pass  (pass_len 0 = open network)
     H_WIFI_STOP     = 0x11,   // —
-    H_AP_START      = 0x12,   // u8 ssid_len, ssid   (open AP, 192.168.4.1, DHCP + DNS hijack)
+    // u8 ssid_len, ssid, u8 keep_station. keep_station leaves the station side running, so the
+    // modem offers the setup AP *and* goes on trying to join the networks it was given. That is
+    // what stops a kiosk that has travelled from being stuck with no way in and no way back.
+    H_AP_START      = 0x12,
     H_AP_STOP       = 0x13,   // —
     H_SCAN          = 0x14,   // — (answered by any number of M_SCAN_RESULT then M_SCAN_DONE)
     H_HTTP_GET      = 0x20,   // u8 id, u32 timeout_ms, u32 credit, u16 url_len, url
@@ -49,6 +52,11 @@ enum {
     H_HTTP_CREDIT   = 0x22,   // u8 id, u32 extra_bytes
     H_SOCK_DATA     = 0x30,   // u8 conn, bytes            (portal: write to the accepted socket)
     H_SOCK_CLOSE    = 0x31,   // u8 conn, u8 abort
+    // u16 url_len, url. Asks the modem whether this network actually reaches the internet. The
+    // answer cannot be inferred from the kiosk's own polling: those go over HTTPS, and a captive
+    // portal cannot intercept TLS — it just makes the handshake fail, which looks exactly like the
+    // server being down. Only a plain-HTTP probe tells the two apart.
+    H_NET_CHECK     = 0x15,
     H_LED           = 0x40,   // u8 on
 };
 
@@ -64,6 +72,7 @@ enum {
     M_WIFI_STATE    = 0x90,   // u8 state (modem_wifi_state_t), u32 ip, i8 rssi, u8 channel
     M_SCAN_RESULT   = 0x91,   // i16 rssi, u8 open, u8 ssid_len, ssid
     M_SCAN_DONE     = 0x92,   // —
+    M_NET_CHECK     = 0x93,   // u8 verdict (modem_net_check_t), u16 status
     M_HTTP_STATUS   = 0xA0,   // u8 id, u16 status
     M_HTTP_HEADER   = 0xA1,   // u8 id, u8 name_len, name, u16 value_len, value
     M_HTTP_BODY     = 0xA2,   // u8 id, bytes           (never more than the credit outstanding)
@@ -99,6 +108,21 @@ typedef enum {
     MODEM_HTTP_ERR_BUSY = -9,
     MODEM_HTTP_ERR_TOO_MANY_REDIRECTS = -10,
 } modem_http_err_t;
+
+// M_NET_CHECK.verdict. The probe is the same trick every operating system uses: fetch a URL whose
+// only correct answer is "204, no content". Anything else on the wire means something is answering
+// on the network's behalf.
+typedef enum {
+    MODEM_NET_ONLINE = 0,     // the probe returned exactly what it should
+    MODEM_NET_CAPTIVE = 1,    // something answered, but not what was asked for: a sign-in portal
+    MODEM_NET_NO_DNS = 2,     // joined, but names do not resolve
+    MODEM_NET_NO_ROUTE = 3,   // joined, resolves, but nothing answers
+} modem_net_check_t;
+
+// The default probe. Overridable at build time; it has to be plain HTTP for the reason above.
+#ifndef MODEM_NET_CHECK_URL
+#define MODEM_NET_CHECK_URL "http://connectivitycheck.gstatic.com/generate_204"
+#endif
 
 // M_HELLO.chip
 enum { MODEM_CHIP_UNKNOWN = 0, MODEM_CHIP_ESP32C3 = 1, MODEM_CHIP_ESP32C2 = 2 };

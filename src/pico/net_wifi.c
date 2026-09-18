@@ -200,7 +200,10 @@ int net_wifi_rssi(void) {
     return (int)rssi;
 }
 
-const char *net_wifi_start_ap(void) {
+bool net_wifi_ap_is_concurrent(void) { return false; }
+
+const char *net_wifi_start_ap(bool keep_station) {
+    (void)keep_station;   // this radio cannot: see the comment below
     if (!initted) return "";
     if (ap_on) return ap_ssid;
     // A station join in flight would keep the radio hopping channels; drop it. The STA interface
@@ -253,6 +256,12 @@ void net_wifi_led(bool on) {
     (void)on;
 #endif
 }
+
+// The cyw43 build has no probe of its own: there is no second processor to run one, and a plain
+// lwIP client here would duplicate http_client.c for a diagnostic. Callers fall back to the
+// behaviour they had before the probe existed (the offline badge and a backoff).
+void net_wifi_check_start(void) {}
+net_check_t net_wifi_check_result(void) { return NET_CHECK_UNSUPPORTED; }
 
 void net_wifi_smps_pwm(bool pwm) {
     if (!initted) return;

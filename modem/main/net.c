@@ -201,10 +201,15 @@ void net_stop(void) {
     set_state(MODEM_WIFI_DOWN);
 }
 
-void net_ap_start(const char *ssid) {
+void net_ap_start(const char *ssid, bool keep_station) {
     if (!ap_netif) ap_netif = esp_netif_create_default_wifi_ap();
-    have_creds = false;
-    if (retry_timer) xTimerStop(retry_timer, 0);
+    // keep_station: the kiosk has credentials but cannot find the network. Offer the setup AP and
+    // go on trying at the same time, so it recovers by itself the moment the network reappears and
+    // the user never has to do anything.
+    if (!keep_station) {
+        have_creds = false;
+        if (retry_timer) xTimerStop(retry_timer, 0);
+    }
 
     wifi_config_t wc = {0};
     size_t n = strnlen(ssid, sizeof wc.ap.ssid);
@@ -218,8 +223,11 @@ void net_ap_start(const char *ssid) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wc));
     ap_on = true;
-    ESP_LOGI(TAG, "provisioning AP \"%s\" up", ssid);
-    set_state(MODEM_WIFI_AP);
+    ESP_LOGI(TAG, "provisioning AP \"%s\" up%s", ssid, keep_station ? " (still trying to join)" : "");
+    // In dual mode the kiosk wants the *station* state — it already knows it asked for the AP, and
+    // what it needs to show is whether it has found a network yet.
+    if (!keep_station) set_state(MODEM_WIFI_AP);
+    else if (have_creds) esp_wifi_connect();
 }
 
 void net_ap_stop(void) {
@@ -234,7 +242,9 @@ void net_scan(void) {
     sc.show_hidden = false;
     esp_err_t err = esp_wifi_scan_start(&sc, false);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "scan start failed: %s", esp_err_to_name(err));
+        // ESP_ERR_WIFI_STATE just means a join is in flight; the host paces its own retries, so
+        // this is ordinary and not worth a warning on the kiosk's console.
+        if (err != ESP_ERR_WIFI_STATE) ESP_LOGW(TAG, "scan start failed: %s", esp_err_to_name(err));
         link_send(M_SCAN_DONE, NULL, 0);
     }
 }

@@ -10,3 +10,5 @@ void httpc_get(uint8_t id, uint32_t timeout_ms, uint32_t credit, const char *url
 void httpc_credit(uint8_t id, uint32_t extra);
 void httpc_cancel(uint8_t id);
 void httpc_abort_all(void);
+// Probes whether this network reaches the internet at all; answers with M_NET_CHECK.
+void httpc_netcheck(const char *url, uint16_t url_len);
