@@ -107,3 +107,11 @@
 #ifndef KIOSK_CONFIG_FLASH_OFFSET
 #define KIOSK_CONFIG_FLASH_OFFSET 0x1FF000u
 #endif
+// The ESP modem's firmware image, which the kiosk writes to it over the UART (modem_flash.c). It
+// is not linked into the firmware: it is its own region, installed by its own UF2, so the two can
+// be built and flashed independently and a modem update does not mean relinking the kiosk.
+// Default 2 MB, which on the Pico 2 W's 4 MB is past the geometry cache and clear of the config
+// sector. v3's RP2354A has 2 MB in total, so that build has to place it deliberately.
+#ifndef KIOSK_MODEM_IMAGE_OFFSET
+#define KIOSK_MODEM_IMAGE_OFFSET 0x200000u
+#endif

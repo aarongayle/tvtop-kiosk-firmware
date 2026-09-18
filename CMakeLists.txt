@@ -69,7 +69,7 @@ if (KIOSK_MODEM)
     list(FILTER KIOSK_PICO_SRC EXCLUDE REGEX "/(net_wifi\\.c|http_client\\.c)$")
     set(KIOSK_NET_SRC "")   # DHCP and DNS servers live on the modem
 else()
-    list(FILTER KIOSK_PICO_SRC EXCLUDE REGEX "/(net_modem\\.c|http_modem\\.c|modem_link\\.c)$")
+    list(FILTER KIOSK_PICO_SRC EXCLUDE REGEX "/(net_modem\\.c|http_modem\\.c|modem_link\\.c|modem_flash\\.c)$")
     set(KIOSK_NET_SRC
         vendor/pico-examples/dhcpserver/dhcpserver.c
         vendor/pico-examples/dnsserver/dnsserver.c)

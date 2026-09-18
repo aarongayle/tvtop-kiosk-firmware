@@ -51,6 +51,7 @@ static uint32_t free_heap(void) { return 12345; }
 #include "hardware/structs/watchdog.h"
 #if KIOSK_MODEM
 #include "modem_link.h"
+#include "modem_flash.h"
 #include "modem_io.h"
 #else
 #include "pico/cyw43_arch.h"
@@ -649,7 +650,8 @@ static void print_help(void) {
            "  netcheck                 probe whether this network really reaches the internet\n"
 #endif
 #if KIOSK_MODEM
-           "  modem [reset|boot]       restart the modem, or drop it into its ROM bootloader\n"
+           "  modem reset|boot|flash|image   restart the modem, park it in its ROM bootloader,\n"
+           "                           write the stored firmware image to it, or report that image\n"
 #endif
            "  sigsweep                 cycle pad and regulator settings, 20 s each\n"
            "  tmds off|on              silence the DVI pins (Wi-Fi interference test); kept across resets\n"
@@ -717,8 +719,22 @@ static void console_exec(char *line) {
 #endif
 #if KIOSK_MODEM
     } else if (strcmp(cmd, "modem") == 0) {
-        // Bring-up aid: `modem reset` restarts the modem firmware, `modem boot` drops it into its
-        // ROM bootloader so esptool (or, on v3, the RP2354A itself) can reflash it.
+        // `modem reset` restarts the modem firmware, `modem boot` parks it in its ROM bootloader
+        // for esptool over USB, and `modem flash` writes the stored image to it over the UART —
+        // which is how v3, with its single USB-C port, is programmed at all.
+        if (argc >= 2 && strcmp(argv[1], "flash") == 0) {
+            if (modem_flash_run()) kiosk_loop_restart();
+            return;
+        }
+        if (argc >= 2 && strcmp(argv[1], "image") == 0) {
+            uint32_t ulen = 0, clen = 0;
+            if (modem_flash_image_present(&ulen, &clen))
+                printf("modem image: %lu bytes, %lu compressed, at 0x%08x\n",
+                       (unsigned long)ulen, (unsigned long)clen, (unsigned)KIOSK_MODEM_IMAGE_OFFSET);
+            else
+                printf("modem image: none installed at 0x%08x\n", (unsigned)KIOSK_MODEM_IMAGE_OFFSET);
+            return;
+        }
         bool boot = argc >= 2 && strcmp(argv[1], "boot") == 0;
         printf("modem: %s\n", boot ? "resetting into the ROM bootloader" : "resetting");
         modem_link_reset(boot);
