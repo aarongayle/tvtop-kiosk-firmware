@@ -21,6 +21,87 @@ int host_video_mode_from_name(const char *name) {
 
 static void erase_sector(void) { memset(host_flash_sector, 0xFF, sizeof host_flash_sector); }
 
+// A v1 sector must survive the upgrade: a firmware update that silently sent every paired kiosk
+// back to its pairing screen would be indistinguishable, from the sofa, from a broken update.
+static void test_migrate_v1(void) {
+    erase_sector();
+    kiosk_config_v1_t v1;
+    memset(&v1, 0, sizeof v1);
+    v1.magic = CONFIG_MAGIC;
+    v1.version = 1;
+    v1.length = sizeof v1;
+    strcpy(v1.wifi_ssid, "Old Net");
+    strcpy(v1.wifi_pass, "old-secret");
+    strcpy(v1.server_base, "https://kiosk.tvtop.games");
+    strcpy(v1.token, "abcdefghijklmnopqrstuvwxyz");
+    strcpy(v1.device_id, "abc123");
+    strcpy(v1.next_url, "https://kiosk.tvtop.games/v1/frame/x?rev=7");
+    strcpy(v1.static_id, "s-deadbeef");
+    v1.video_mode = 2;
+    v1.wifi_channel = 6;
+    v1.crc32 = crc32_update(0, &v1, offsetof(kiosk_config_v1_t, crc32));
+    memcpy(host_flash_sector, &v1, sizeof v1);
+
+    CHECK(config_load() == true);
+    CHECK(kiosk_config.version == CONFIG_VERSION);
+    CHECK(kiosk_config.net_count == 1);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "Old Net") == 0);
+    CHECK(strcmp(kiosk_config.nets[0].pass, "old-secret") == 0);
+    // The pairing, the server and the cached frame URL all have to come across, or the upgrade
+    // costs the user a re-pair and a fresh geometry download.
+    CHECK(strcmp(kiosk_config.token, "abcdefghijklmnopqrstuvwxyz") == 0);
+    CHECK(strcmp(kiosk_config.device_id, "abc123") == 0);
+    CHECK(strcmp(kiosk_config.static_id, "s-deadbeef") == 0);
+    CHECK(kiosk_config.video_mode == 2 && kiosk_config.wifi_channel == 6);
+
+    // It is marked dirty so the sector is rewritten in the new layout, and reads back as v2.
+    CHECK(config_save());
+    memset(&kiosk_config, 0, sizeof kiosk_config);
+    CHECK(config_load() == true);
+    CHECK(kiosk_config.version == CONFIG_VERSION && kiosk_config.net_count == 1);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "Old Net") == 0);
+
+    // A corrupt v1 sector is not migrated; it falls back to defaults rather than inventing data.
+    erase_sector();
+    v1.crc32 ^= 1u;
+    memcpy(host_flash_sector, &v1, sizeof v1);
+    CHECK(config_load() == false);
+    CHECK(kiosk_config.net_count == 0 && kiosk_config.token[0] == 0);
+}
+
+static void test_network_list(void) {
+    erase_sector();
+    config_load();
+    config_net_forget_all();
+    CHECK(config_net_add("A", "a1") && config_net_add("B", "b1") && config_net_add("C", ""));
+    // Newest first.
+    CHECK(kiosk_config.net_count == 3 && strcmp(kiosk_config.nets[0].ssid, "C") == 0);
+    CHECK(config_net_find("A") == 2 && config_net_find("nope") == -1);
+    // Re-adding updates the password and moves it to the front.
+    CHECK(config_net_add("A", "a2"));
+    CHECK(kiosk_config.net_count == 3 && strcmp(kiosk_config.nets[0].ssid, "A") == 0);
+    CHECK(strcmp(kiosk_config.nets[0].pass, "a2") == 0);
+    config_net_promote(2);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "B") == 0);
+    CHECK(config_net_forget("A") && !config_net_forget("A"));
+    CHECK(kiosk_config.net_count == 2);
+    // Full: the least recently joined is the one that goes.
+    config_net_forget_all();
+    char name[4];
+    for (int i = 0; i < KIOSK_MAX_NETWORKS + 2; i++) {
+        snprintf(name, sizeof name, "n%d", i);
+        CHECK(config_net_add(name, "p"));
+    }
+    CHECK(kiosk_config.net_count == KIOSK_MAX_NETWORKS);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "n9") == 0);
+    CHECK(config_net_find("n0") == -1 && config_net_find("n1") == -1);   // evicted
+    CHECK(!config_net_add("", "p"));
+    char toolong[64];
+    memset(toolong, 'x', sizeof toolong - 1);
+    toolong[sizeof toolong - 1] = 0;
+    CHECK(!config_net_add(toolong, "p"));
+}
+
 static void test_crc32(void) {
     // Standard check value for "123456789".
     CHECK(crc32_update(0, "123456789", 9) == 0xCBF43926u);
@@ -38,7 +119,7 @@ static void test_defaults_on_blank(void) {
     CHECK(kiosk_config.version == CONFIG_VERSION);
     CHECK(kiosk_config.length == sizeof(kiosk_config_t));
     CHECK(strcmp(kiosk_config.server_base, "https://kiosk.tvtop.games") == 0);
-    CHECK(kiosk_config.wifi_ssid[0] == 0);
+    CHECK(kiosk_config.nets[0].ssid[0] == 0);
     CHECK(kiosk_config.token[0] == 0);
     CHECK(kiosk_config.video_mode == 0);
     CHECK(kiosk_config.crc32 == crc32_update(0, &kiosk_config, offsetof(kiosk_config_t, crc32)));
@@ -47,8 +128,8 @@ static void test_defaults_on_blank(void) {
 static void test_save_load_roundtrip(void) {
     erase_sector();
     config_load();
-    strcpy(kiosk_config.wifi_ssid, "Home Net");
-    strcpy(kiosk_config.wifi_pass, "hunter22");
+    strcpy(kiosk_config.nets[0].ssid, "Home Net");
+    strcpy(kiosk_config.nets[0].pass, "hunter22");
     strcpy(kiosk_config.token, "k7f2qmabcdefghjklmnpqrstuv");
     strcpy(kiosk_config.device_id, "vy6kx4");
     strcpy(kiosk_config.next_url, "https://kiosk.tvtop.games/v1/frame/k7f2qm?rev=1&s=s-a8d91f");
@@ -64,8 +145,8 @@ static void test_save_load_roundtrip(void) {
 
     memset(&kiosk_config, 0, sizeof kiosk_config);
     CHECK(config_load() == true);
-    CHECK(strcmp(kiosk_config.wifi_ssid, "Home Net") == 0);
-    CHECK(strcmp(kiosk_config.wifi_pass, "hunter22") == 0);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "Home Net") == 0);
+    CHECK(strcmp(kiosk_config.nets[0].pass, "hunter22") == 0);
     CHECK(strcmp(kiosk_config.token, "k7f2qmabcdefghjklmnpqrstuv") == 0);
     CHECK(strcmp(kiosk_config.device_id, "vy6kx4") == 0);
     CHECK(strcmp(kiosk_config.static_id, "s-a8d91f") == 0);
@@ -75,16 +156,16 @@ static void test_save_load_roundtrip(void) {
 static void test_corruption_rejected(void) {
     erase_sector();
     config_load();
-    strcpy(kiosk_config.wifi_ssid, "x");
+    strcpy(kiosk_config.nets[0].ssid, "x");
     CHECK(config_save());
 
     // One flipped bit in the payload → crc mismatch → defaults.
-    host_flash_sector[offsetof(kiosk_config_t, wifi_ssid)] ^= 0x01;
+    host_flash_sector[offsetof(kiosk_config_t, nets)] ^= 0x01;
     CHECK(config_load() == false);
-    CHECK(kiosk_config.wifi_ssid[0] == 0);
+    CHECK(kiosk_config.nets[0].ssid[0] == 0);
 
     // Wrong version.
-    strcpy(kiosk_config.wifi_ssid, "y");
+    strcpy(kiosk_config.nets[0].ssid, "y");
     CHECK(config_save());
     kiosk_config_t *img = (kiosk_config_t *)host_flash_sector;
     uint16_t v = CONFIG_VERSION + 1;
@@ -95,7 +176,7 @@ static void test_corruption_rejected(void) {
     CHECK(config_load() == false);
 
     // Wrong length with a valid crc.
-    strcpy(kiosk_config.wifi_ssid, "z");
+    strcpy(kiosk_config.nets[0].ssid, "z");
     CHECK(config_save());
     uint16_t l = sizeof(kiosk_config_t) - 4;
     memcpy(&img->length, &l, sizeof l);
@@ -104,7 +185,7 @@ static void test_corruption_rejected(void) {
     CHECK(config_load() == false);
 
     // Unterminated string with a valid crc.
-    strcpy(kiosk_config.wifi_ssid, "w");
+    strcpy(kiosk_config.nets[0].ssid, "w");
     CHECK(config_save());
     memset(img->server_base, 'A', sizeof img->server_base);
     crc = crc32_update(0, img, offsetof(kiosk_config_t, crc32));
@@ -112,7 +193,7 @@ static void test_corruption_rejected(void) {
     CHECK(config_load() == false);
 
     // Out-of-range video mode with a valid crc.
-    strcpy(kiosk_config.wifi_ssid, "v");
+    strcpy(kiosk_config.nets[0].ssid, "v");
     CHECK(config_save());
     img->video_mode = 7;
     crc = crc32_update(0, img, offsetof(kiosk_config_t, crc32));
@@ -124,7 +205,7 @@ static void test_debounce(void) {
     erase_sector();
     config_load();
     host_now_ms = 1000;
-    strcpy(kiosk_config.wifi_ssid, "debounced");
+    strcpy(kiosk_config.nets[0].ssid, "debounced");
     config_mark_dirty();
     config_poll();
     CHECK(host_flash_sector[0] == 0xFF);            // nothing written yet
@@ -141,7 +222,7 @@ static void test_debounce(void) {
     CHECK(host_flash_sector[0] != 0xFF);
     kiosk_config_t img;
     memcpy(&img, host_flash_sector, sizeof img);
-    CHECK(strcmp(img.wifi_ssid, "debounced") == 0);
+    CHECK(strcmp(img.nets[0].ssid, "debounced") == 0);
     // Once written, polling again is a no-op (erase the sector to see whether it writes).
     erase_sector();
     host_now_ms = 9000;
@@ -194,6 +275,8 @@ static void test_save_after_defaults_roundtrips_exactly(void) {
 
 int main(void) {
     test_crc32();
+    test_migrate_v1();
+    test_network_list();
     test_defaults_on_blank();
     test_save_load_roundtrip();
     test_corruption_rejected();

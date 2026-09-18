@@ -5,6 +5,7 @@
 // plus the three moments the device has no frame for: no Wi-Fi credentials (provisioning), joining
 // Wi-Fi, and registering. Each of those is drawn from a built-in JSON frame through the normal
 // decoder so there is exactly one rendering path.
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +63,8 @@ static bool overlay_offline, overlay_version;
 static char reg_body[600];
 static size_t reg_len;
 static uint32_t stat_decode_ms, stat_render_ms, stat_pool_bytes, stat_frames, stat_errors;
+static uint32_t netcheck_asked_ms;          // see "joined, but is anything out there?" below
+static bool netcheck_waiting;               // a verdict we asked for and have not acted on
 static char last_error[48];
 
 static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
@@ -332,6 +335,8 @@ static void frame_on_complete(void *ctx, int err, int status) {
     }
     consecutive_failures = 0;
     consecutive_timeouts = 0;
+    netcheck_waiting = false;
+    netcheck_asked_ms = 0;
     if (watchdog_hw->scratch[0]) watchdog_hw->scratch[0] = 0;   // the network works: recovery budget restored
     if (overlay_offline) overlay_offline = false;
     if (status == 304) { next_request_ms = now + POLL_FLOOR_MS; return; }
@@ -393,6 +398,248 @@ static void frame_on_complete(void *ctx, int err, int status) {
 static const http_sink_t reg_sink = { reg_on_status, NULL, reg_on_body, reg_on_complete };
 static const http_sink_t frame_sink = { frame_on_status, NULL, frame_on_body, frame_on_complete };
 
+// ---- finding a network ------------------------------------------------------------------------
+//
+// A kiosk that travels is plugged into a strange TV in a strange room, and the only thing it can
+// assume is that nothing is where it was. So: scan, try whichever remembered network is actually
+// in range strongest-first, and — this is the part that matters — put the setup AP up alongside
+// the search once it has been fruitless for a while. Before this, a device whose network was not
+// present sat on "Connecting…" for ever with no way in short of a USB cable, which for a device
+// whose whole premise is "plug it into any TV" was the wrong way round.
+//
+// Nothing here ever clears the stored networks. The AP is an addition, not a reset: if the network
+// reappears while someone is still looking for their phone, the kiosk simply joins and carries on.
+
+#define JOIN_ATTEMPT_MS    20000u   // one network gets this long before the next is tried
+#define JOIN_FALLBACK_MS   45000u   // fruitless for this long: raise the setup AP as well
+#define JOIN_SCAN_EVERY_MS 12000u
+// cyw43 only (see net_wifi_ap_is_concurrent): that radio cannot hold the AP up and keep joining,
+// so the two take turns. Long enough for someone to finish with the portal, short enough that a
+// network coming back is noticed within a minute.
+#define JOIN_AP_WINDOW_MS  60000u
+#define JOIN_STA_WINDOW_MS 25000u
+
+static uint32_t join_started_ms;
+static uint32_t attempt_started_ms;
+static int attempt_index = -1;          // into kiosk_config.nets; -1 = nothing in flight
+static bool fallback_ap;                // the setup AP is up alongside the search
+static uint32_t window_started_ms;      // cyw43 alternation
+static bool window_is_ap;
+static uint32_t last_scan_ms;
+static char screen_sig[192];            // redraw only when the words would change
+
+// The remembered network with the strongest live signal. -1 when the scan saw none of them (or
+// has not run yet, in which case the caller falls back to the most recently used).
+static int best_known_in_range(void) {
+    int best = -1;
+    int16_t best_rssi = INT16_MIN;
+    for (uint8_t i = 0; i < wifi_scan_count(); i++) {
+        wifi_sighting_t s;
+        if (!wifi_scan_get(i, &s)) continue;
+        int at = config_net_find(s.ssid);
+        if (at < 0) continue;
+        if (s.rssi > best_rssi) { best_rssi = s.rssi; best = at; }
+    }
+    return best;
+}
+
+// "Gayle · Home · Pixel" — bounded, and honest about what it left out.
+static void join_list(char *out, size_t cap, bool saved) {
+    size_t n = 0;
+    out[0] = 0;
+    unsigned count = saved ? kiosk_config.net_count : wifi_scan_count();
+    for (unsigned i = 0; i < count; i++) {
+        const char *ssid;
+        if (saved) {
+            ssid = kiosk_config.nets[i].ssid;
+        } else {
+            wifi_sighting_t s;
+            if (!wifi_scan_get((uint8_t)i, &s)) break;
+            ssid = s.ssid;
+        }
+        size_t need = strlen(ssid) + 3;
+        if (n + need + 4 >= cap) { snprintf(out + n, cap - n, "%s…", n ? " · " : ""); return; }
+        n += (size_t)snprintf(out + n, cap - n, "%s%s", n ? " · " : "", ssid);
+    }
+}
+
+static void join_draw(void) {
+    char saved[120], nearby[160], body[420];
+    join_list(saved, sizeof saved, true);
+    join_list(nearby, sizeof nearby, false);
+
+    int n = 0;
+    if (kiosk_config.net_count == 0) {
+        n = snprintf(body, sizeof body, "No Wi-Fi networks saved yet");
+    } else if (best_known_in_range() >= 0 || wifi_scan_age_ms() == UINT32_MAX) {
+        n = snprintf(body, sizeof body, ">Trying %s\nSaved: %s",
+                     attempt_index >= 0 ? kiosk_config.nets[attempt_index].ssid : saved, saved);
+    } else {
+        n = snprintf(body, sizeof body, ">None of your networks is in range\nSaved: %s", saved);
+    }
+    if (n > 0 && nearby[0] && (size_t)n < sizeof body)
+        snprintf(body + n, sizeof body - (size_t)n, "\nNearby: %s", nearby);
+
+    // Redraw only on a change: this runs every poll, and re-rendering 1080p for the same words
+    // would eat the frame budget for nothing.
+    if (strncmp(screen_sig, body, sizeof screen_sig) == 0) return;
+    strncpy(screen_sig, body, sizeof screen_sig - 1);
+    screen_sig[sizeof screen_sig - 1] = 0;
+    kiosk_show_builtin(BUILTIN_WIFI_SETUP, fallback_ap ? provision_ap_ssid() : "", body);
+}
+
+static void join_reset(void) {
+    join_started_ms = now_ms();
+    attempt_started_ms = 0;
+    attempt_index = -1;
+    last_scan_ms = 0;
+    window_started_ms = join_started_ms;
+    window_is_ap = false;
+    screen_sig[0] = 0;
+}
+
+static void join_begin_attempt(int index) {
+    if (index < 0 || index >= (int)kiosk_config.net_count) return;
+    attempt_index = index;
+    attempt_started_ms = now_ms();
+    printf("wifi: trying \"%s\"\n", kiosk_config.nets[index].ssid);
+    net_wifi_connect(kiosk_config.nets[index].ssid, kiosk_config.nets[index].pass);
+}
+
+// Called once a station link is up: remember which network worked, so the list orders itself and
+// the next power-on tries the right one first.
+static void join_succeeded(void) {
+    if (attempt_index > 0) {
+        config_net_promote(attempt_index);
+        config_mark_dirty();
+    }
+    attempt_index = -1;
+    if (fallback_ap) {
+        printf("wifi: joined; taking the setup AP down\n");
+        provision_stop();
+        fallback_ap = false;
+    }
+    screen_sig[0] = 0;
+}
+
+// The search, one step per main-loop pass. Returns true once the station is up.
+static bool join_poll(void) {
+    uint32_t now = now_ms();
+    if (net_wifi_state() == WIFI_UP) { join_succeeded(); return true; }
+    if (kiosk_config.net_count == 0) { join_draw(); return false; }
+
+    // Scan on a timer so the picture of the room stays current while the kiosk hunts — but only
+    // between attempts. A radio that is mid-join refuses to scan (esp_wifi returns
+    // ESP_ERR_WIFI_STATE), and since a fruitless search is a continuous stream of attempts, asking
+    // at the wrong moment would mean never scanning at all in the one case that needs it.
+    bool sta_idle = net_wifi_state() != WIFI_CONNECTING;
+    if (sta_idle && !wifi_scan_running() && (last_scan_ms == 0 || now - last_scan_ms >= JOIN_SCAN_EVERY_MS)) {
+        last_scan_ms = now;
+        wifi_scan_request();
+    }
+
+    bool sta_allowed = true;
+    if (fallback_ap && !net_wifi_ap_is_concurrent()) {
+        // Take turns. Never interrupt someone who is mid-way through the portal.
+        uint32_t window = window_is_ap ? JOIN_AP_WINDOW_MS : JOIN_STA_WINDOW_MS;
+        if (now - window_started_ms >= window && !(window_is_ap && provision_busy())) {
+            window_is_ap = !window_is_ap;
+            window_started_ms = now;
+            if (window_is_ap) provision_start(true);
+            else { provision_stop(); attempt_index = -1; }
+        }
+        sta_allowed = !window_is_ap;
+    }
+
+    if (sta_allowed) {
+        int want = best_known_in_range();
+        bool stale = attempt_index < 0 || (attempt_started_ms && now - attempt_started_ms >= JOIN_ATTEMPT_MS);
+        if (stale) {
+            if (want < 0) {
+                // Nothing known is in range. Keep cycling the list anyway: a hidden SSID never
+                // shows up in a scan, and a scan can miss a network that is really there.
+                int next = attempt_index < 0 ? 0 : (attempt_index + 1) % (int)kiosk_config.net_count;
+                join_begin_attempt(next);
+            } else if (want != attempt_index) {
+                join_begin_attempt(want);
+            } else {
+                attempt_started_ms = now;   // give the same (and best) network another go
+                net_wifi_connect(kiosk_config.nets[want].ssid, kiosk_config.nets[want].pass);
+            }
+        }
+    }
+
+    if (!fallback_ap && now - join_started_ms >= JOIN_FALLBACK_MS) {
+        fallback_ap = true;
+        window_is_ap = !net_wifi_ap_is_concurrent();
+        window_started_ms = now;
+        printf("wifi: no luck after %u s; bringing up the setup AP as well\n", (unsigned)(JOIN_FALLBACK_MS / 1000u));
+        provision_start(true);
+        screen_sig[0] = 0;
+    }
+
+    join_draw();
+    return false;
+}
+
+// ---- joined, but is anything out there? -------------------------------------------------------
+//
+// Failing polls with the link up have two very different causes, and telling the user the wrong one
+// wastes their time. Either the kiosk server is unreachable — nothing they can do — or this
+// network wants a browser sign-in it will never get, in which case the answer is "use another
+// network" and the kiosk should be showing them how.
+#define NETCHECK_AFTER_FAILURES 2
+#define NETCHECK_EVERY_MS 60000u
+
+static void netcheck_poll(void) {
+    uint32_t now = now_ms();
+    if (consecutive_failures >= NETCHECK_AFTER_FAILURES && net_wifi_state() == WIFI_UP &&
+        (netcheck_asked_ms == 0 || now - netcheck_asked_ms >= NETCHECK_EVERY_MS) &&
+        !netcheck_waiting) {
+        netcheck_asked_ms = now;
+        netcheck_waiting = true;
+        net_wifi_check_start();
+    }
+
+    // Only a verdict this loop asked for is acted on. The result is sticky, so without this a
+    // console probe, or a poll that then succeeded, would re-trigger the whole thing every pass.
+    if (!netcheck_waiting) return;
+    net_check_t v = net_wifi_check_result();
+    if (v == NET_CHECK_IDLE || v == NET_CHECK_PENDING || v == NET_CHECK_UNSUPPORTED) return;
+    netcheck_waiting = false;
+
+    if (v == NET_CHECK_ONLINE) {
+        // The network is fine, so this is ours to fix, not theirs. Say nothing new: the offline
+        // badge over the last frame already covers it.
+        printf("net: internet reachable; the kiosk server is not\n");
+        return;
+    }
+
+    const char *ssid = attempt_index >= 0 ? kiosk_config.nets[attempt_index].ssid
+                     : kiosk_config.net_count ? kiosk_config.nets[0].ssid : "this network";
+    const char *body =
+        v == NET_CHECK_CAPTIVE
+            ? ">This network needs a browser sign-in\n"
+              "The kiosk has no browser, and the sign-in is tied to\n"
+              "the device asking — so a phone cannot do it for it.\n"
+              "A phone hotspot is the reliable way round this."
+        : v == NET_CHECK_NO_DNS
+            ? ">Joined, but names do not resolve\n"
+              "Often a sign-in page waiting on the other side."
+            : ">Joined, but nothing answers\n"
+              "The network has no route to the internet.";
+    printf("net: %s\n", v == NET_CHECK_CAPTIVE ? "captive portal detected" : "no internet on this network");
+    kiosk_show_builtin(BUILTIN_NO_INTERNET, ssid, body);
+    frame_valid = false;   // the overlay has nothing to sit on now
+
+    // Give them the means as well as the diagnosis: with the setup AP up they can switch to a
+    // hotspot without hunting for a laptop.
+    if (!fallback_ap) {
+        fallback_ap = true;
+        provision_start(true);
+    }
+}
+
 // ---- state machine ---------------------------------------------------------------------------
 
 static void start_poll_state(void) {
@@ -435,6 +682,9 @@ void kiosk_loop_init(void) {
 }
 
 void kiosk_loop_restart(void) {
+    fallback_ap = false;
+    netcheck_waiting = false;
+    netcheck_asked_ms = 0;
     http_cancel(http_client_get());
     request_active = false;
     rsp_decoding = false;
@@ -448,15 +698,17 @@ void kiosk_loop_poll(void) {
     uint32_t now = now_ms();
     switch (state) {
     case KS_BOOT:
-        if (!kiosk_config.wifi_ssid[0]) { provision_start(); state = KS_PROVISION; return; }
-        kiosk_show_builtin(BUILTIN_CONNECTING, kiosk_config.wifi_ssid, NULL);
-        net_wifi_connect(kiosk_config.wifi_ssid, kiosk_config.wifi_pass);
+        // A kiosk that has never been told about a network goes straight to the setup AP, as
+        // before. One that has is handed to the join manager, which will raise the AP itself if it
+        // cannot find anything — so there is no longer a path that ends with no way in.
+        if (kiosk_config.net_count == 0) { provision_start(false); state = KS_PROVISION; return; }
+        join_reset();
         state = KS_WIFI_WAIT;
         return;
     case KS_PROVISION:
         return;   // the portal or console will restart us
     case KS_WIFI_WAIT:
-        if (net_wifi_state() != WIFI_UP) return;
+        if (!join_poll()) return;
         net_wifi_led(true);
         retune_for_channel();
         if (!kiosk_config.token[0]) {
@@ -468,7 +720,7 @@ void kiosk_loop_poll(void) {
         }
         return;
     case KS_REGISTER:
-        if (net_wifi_state() != WIFI_UP) { http_cancel(http_client_get()); request_active = false; state = KS_WIFI_WAIT; return; }
+        if (net_wifi_state() != WIFI_UP) { http_cancel(http_client_get()); request_active = false; join_reset(); state = KS_WIFI_WAIT; return; }
         if (request_active || (int32_t)(now - next_request_ms) < 0) return;
         {
             char url[KIOSK_MAX_URL];
@@ -480,9 +732,11 @@ void kiosk_loop_poll(void) {
         }
         return;
     case KS_POLL:
+        netcheck_poll();
         if (net_wifi_state() != WIFI_UP) {
             if (request_active) { http_cancel(http_client_get()); request_active = false; rsp_decoding = false; }
             net_wifi_led(false);
+            join_reset();
             state = KS_WIFI_WAIT;
             return;
         }

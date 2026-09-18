@@ -10,6 +10,11 @@ option(KIOSK_NO_RADIO "Diagnostic build: never start the Wi-Fi radio" OFF)
 option(KIOSK_MODEM "Use an ESP32 modem over UART instead of the on-board cyw43 radio" OFF)
 set(KIOSK_VIDEO_MODE "" CACHE STRING "Default video mode until one is stored. Pico W: 720p30 | 720p30rb | 480p60 | 720x480p60 | 960x540p60 | 1066x600p50 (default 720p30). Pico 2 W: 720p60 | 960x540p60 | 480p60 (default 720p60)")
 set(KIOSK_SERVER_BASE "https://kiosk.tvtop.games" CACHE STRING "Default kiosk server base URL")
+# Whether a network really reaches the internet is decided by fetching this and expecting 204 with
+# no body; anything else means something is answering on the network's behalf (a sign-in portal).
+# It must be plain HTTP — a portal cannot intercept TLS, it can only break it, which is
+# indistinguishable from the server being down. The kiosk sends this to the modem per probe.
+set(KIOSK_NET_CHECK_URL "" CACHE STRING "Connectivity probe URL (default: Google's generate_204)")
 set(KIOSK_WIFI_SSID "" CACHE STRING "Optional compiled-in Wi-Fi SSID (provisioning otherwise)")
 set(KIOSK_WIFI_PASSWORD "" CACHE STRING "Optional compiled-in Wi-Fi password")
 
@@ -86,6 +91,7 @@ string(REPLACE "_" "-" KIOSK_MODEL "${PICO_BOARD}")
 target_compile_definitions(tvtop_kiosk PRIVATE
     CYW43_PIO_CLOCK_DIV_DYNAMIC=1 # SPI divider chosen at runtime from the overclocked sys clock
     KIOSK_MODEM=$<BOOL:${KIOSK_MODEM}>
+    $<$<BOOL:${KIOSK_NET_CHECK_URL}>:MODEM_NET_CHECK_URL="${KIOSK_NET_CHECK_URL}">
     KIOSK_MODEL="${KIOSK_MODEL}"
     KIOSK_TLS=$<BOOL:${KIOSK_TLS}>
     KIOSK_NO_RADIO=$<BOOL:${KIOSK_NO_RADIO}>

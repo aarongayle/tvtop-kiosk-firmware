@@ -250,12 +250,15 @@ typedef struct {
 } net_entry_t;
 
 static bool active;
+static bool netcheck_watch;      // the console asked for a probe and wants the verdict printed
 static char ap_ssid[16];
 static net_entry_t nets[PORTAL_MAX_NETS];
 static uint8_t nets_n;
 static volatile bool scan_requested;     // set by GET /scan (callback), consumed by provision_poll
 static uint32_t scan_started_ms;
+static uint32_t scan_done_ms;
 static bool scan_ever;
+static bool scan_done_ever;
 
 // A portal POST is staged here by the lwIP callback and applied + saved by provision_poll.
 typedef struct {
@@ -291,6 +294,15 @@ static void nets_add(const uint8_t *ssid, size_t ssid_len, int16_t rssi, bool op
     nets[slot].ssid[ssid_len] = 0;
     nets[slot].rssi = rssi;
     nets[slot].open = open;
+}
+
+static void nets_sort(void) {
+    for (unsigned i = 1; i < nets_n; i++) {
+        net_entry_t key = nets[i];
+        unsigned j = i;
+        while (j > 0 && nets[j - 1].rssi < key.rssi) { nets[j] = nets[j - 1]; j--; }
+        nets[j] = key;
+    }
 }
 
 // ---- HTTP: connection state, request parsing, response building ----------------------------
@@ -412,7 +424,7 @@ static void respond_config_json(conn_t *c) {
     size_t len = 0;
     char *b = c->buf;
     bool ok = json_append(b, sizeof c->buf, &len, "{\"ssid\":")
-        && json_append_str(b, sizeof c->buf, &len, kiosk_config.wifi_ssid, sizeof kiosk_config.wifi_ssid)
+        && json_append_str(b, sizeof c->buf, &len, kiosk_config.net_count ? kiosk_config.nets[0].ssid : "", sizeof kiosk_config.nets[0].ssid)
         && json_append(b, sizeof c->buf, &len, ",\"server\":")
         && json_append_str(b, sizeof c->buf, &len, kiosk_config.server_base, sizeof kiosk_config.server_base)
         && json_append(b, sizeof c->buf, &len, ",\"mode\":")
@@ -591,8 +603,16 @@ static void print_status(void) {
     printf("wifi: %s", wifi_state_name(ws));
     if (ws == WIFI_UP) printf(", ip %s, rssi %d dBm", net_wifi_ip(ip, sizeof ip), net_wifi_rssi());
     if (ws == WIFI_AP) printf(" %s at " PORTAL_IP, ap_ssid);
-    printf("\nssid: %s%s\nserver: %s\nmode: %s\nregistered: %s%s%s\nfw: %s\nheap free: %u bytes\nuptime: %u s\n",
-           kiosk_config.wifi_ssid, kiosk_config.wifi_ssid[0] ? "" : "(none - use `wifi <ssid> <password>`)",
+    printf("\n");
+    if (!kiosk_config.net_count) {
+        printf("networks: none - use `wifi <ssid> <password>`\n");
+    } else {
+        printf("networks: %u known, most recent first\n", kiosk_config.net_count);
+        for (unsigned i = 0; i < kiosk_config.net_count; i++)
+            printf("  %u. %s%s\n", i + 1, kiosk_config.nets[i].ssid,
+                   kiosk_config.nets[i].pass[0] ? "" : " (open)");
+    }
+    printf("server: %s\nmode: %s\nregistered: %s%s%s\nfw: %s\nheap free: %u bytes\nuptime: %u s\n",
            kiosk_config.server_base, video_mode_info((video_mode_t)kiosk_config.video_mode)->name,
            kiosk_config.token[0] ? "yes, id " : "no", kiosk_config.token[0] ? kiosk_config.device_id : "",
            kiosk_config.next_url[0] ? " (next_url cached)" : "",
@@ -608,7 +628,8 @@ static void print_help(void) {
            "  help                     this list\n"
            "  status                   loop state, wifi, config, heap\n"
            "  stats                    render/scanout counters\n"
-           "  wifi <ssid> [password]   join a network (quote an ssid with spaces; no password = open)\n"
+           "  wifi <ssid> [password]   remember a network and join it (quote an ssid with spaces; no password = open)\n"
+           "  forget <ssid> | all      drop a remembered network\n"
            "  server <url>             kiosk server base, e.g. server http://192.168.1.10:8080\n"
            "  mode <" KIOSK_MODE_NAMES ">   video mode (reboots)\n"
            "  scan                     list nearby networks\n"
@@ -625,6 +646,7 @@ static void print_help(void) {
            "  smps pwm|save            3V3 regulator mode\n"
 #ifndef PROVISION_HOST_TEST
            "  portal                   start the provisioning AP and captive portal now\n"
+           "  netcheck                 probe whether this network really reaches the internet\n"
 #endif
 #if KIOSK_MODEM
            "  modem [reset|boot]       restart the modem, or drop it into its ROM bootloader\n"
@@ -679,13 +701,19 @@ static void console_exec(char *line) {
         }
 #endif
 #ifndef PROVISION_HOST_TEST
+    } else if (strcmp(cmd, "netcheck") == 0) {
+        // Asks the radio whether this network actually reaches the internet, rather than waiting
+        // for the kiosk to work it out from failing polls.
+        net_wifi_check_start();
+        netcheck_watch = true;
+        printf("netcheck: probing...\n");
     } else if (strcmp(cmd, "portal") == 0) {
         // Brings the provisioning AP and the captive portal up without wiping the stored
         // credentials, which `factory` would. The station drops when the AP starts, so the loop
         // parks itself in wifi-wait; saving the form reboots as usual, and so does `reboot` if you
         // only wanted a look.
         if (provision_active()) { printf("portal: already running as \"%s\"\n", provision_ap_ssid()); return; }
-        provision_start();
+        provision_start(false);
 #endif
 #if KIOSK_MODEM
     } else if (strcmp(cmd, "modem") == 0) {
@@ -769,9 +797,20 @@ static void console_exec(char *line) {
         size_t pl = strlen(pass);
         if (pl > 64) { printf("error: password longer than 64 characters\n"); return; }
         if (pl != 0 && pl < 8) { printf("error: a WPA2 password has at least 8 characters\n"); return; }
-        copy_bounded(kiosk_config.wifi_ssid, sizeof kiosk_config.wifi_ssid, ssid, strlen(ssid));
-        copy_bounded(kiosk_config.wifi_pass, sizeof kiosk_config.wifi_pass, pass, pl);
+        if (!config_net_add(ssid, pass)) { printf("wifi: ssid too long\n"); return; }
         printf("wifi: joining \"%s\" (%s)\n", ssid, pl ? "WPA2" : "open");
+        apply_and_restart();
+    } else if (strcmp(cmd, "forget") == 0) {
+        if (argc < 2) { printf("usage: forget <ssid> | forget all\n"); return; }
+        if (strcmp(argv[1], "all") == 0) {
+            config_net_forget_all();
+            printf("forgot every network\n");
+        } else if (config_net_forget(argv[1])) {
+            printf("forgot \"%s\" (%u left)\n", argv[1], kiosk_config.net_count);
+        } else {
+            printf("no saved network called \"%s\"\n", argv[1]);
+            return;
+        }
         apply_and_restart();
     } else if (strcmp(cmd, "server") == 0) {
         if (argc < 2) { printf("usage: server <http://host[:port]>\n"); return; }
@@ -1191,9 +1230,9 @@ static void portal_tick(uint32_t now) { (void)now; }   // lwIP drives its own id
 
 // ---- Public API -------------------------------------------------------------------------------
 
-void provision_start(void) {
+void provision_start(bool keep_station) {
     if (active) return;
-    const char *ssid = net_wifi_start_ap();
+    const char *ssid = net_wifi_start_ap(keep_station);
     copy_bounded(ap_ssid, sizeof ap_ssid, ssid, strlen(ssid));
     cyw43_arch_lwip_begin();
     bool ok = portal_listen();
@@ -1201,8 +1240,11 @@ void provision_start(void) {
     if (!ok) printf("portal: listen failed\n");
     active = true;
     scan_requested = true;   // have results ready before the phone loads the page
-    kiosk_show_builtin(BUILTIN_PROVISION, ap_ssid, "http://" PORTAL_IP);
-    printf("provisioning: join Wi-Fi \"%s\" and open " PORTAL_URL ", or type `help` here\n", ap_ssid);
+    // With keep_station the kiosk is still hunting for a network it knows, and the caller owns the
+    // screen so it can say both things at once.
+    if (!keep_station) kiosk_show_builtin(BUILTIN_PROVISION, ap_ssid, "http://" PORTAL_IP);
+    printf("provisioning: join Wi-Fi \"%s\" and open " PORTAL_URL ", or type `help` here%s\n",
+           ap_ssid, keep_station ? " (still retrying your networks)" : "");
 }
 
 void provision_stop(void) {
@@ -1215,7 +1257,27 @@ void provision_stop(void) {
     ap_ssid[0] = 0;
 }
 
+uint8_t wifi_scan_count(void) { return nets_n; }
+
+bool wifi_scan_get(uint8_t index, wifi_sighting_t *out) {
+    if (index >= nets_n || !out) return false;
+    out->ssid = nets[index].ssid;
+    out->rssi = nets[index].rssi;
+    out->open = nets[index].open;
+    return true;
+}
+
+void wifi_scan_request(void) { scan_requested = true; }
+bool wifi_scan_running(void) { return scan_active(); }
+
+uint32_t wifi_scan_age_ms(void) {
+    if (!scan_done_ever) return UINT32_MAX;
+    return provision_now_ms() - scan_done_ms;
+}
+
 bool provision_active(void) { return active; }
+
+bool provision_busy(void) { return portal_busy(); }
 
 const char *provision_ap_ssid(void) { return ap_ssid; }
 
@@ -1223,17 +1285,29 @@ void provision_poll(void) {
     uint32_t now = provision_now_ms();
     portal_tick(now);
 
+#ifndef PROVISION_HOST_TEST
+    if (netcheck_watch) {
+        static const char *names[] = { "idle", "pending", "online",
+                                       "captive portal - this network wants a browser sign-in",
+                                       "no dns", "no route to the internet", "unsupported on this build" };
+        net_check_t v = net_wifi_check_result();
+        if (v != NET_CHECK_PENDING && v != NET_CHECK_IDLE) {
+            netcheck_watch = false;
+            printf("netcheck: %s\n", names[v < 7 ? v : 0]);
+        }
+    }
+#endif
+
     if (save_requested && !reboot_at_ms) {
         pending_save_t p;
         cyw43_arch_lwip_begin();
         p = pending;
         cyw43_arch_lwip_end();
-        copy_bounded(kiosk_config.wifi_ssid, sizeof kiosk_config.wifi_ssid, p.ssid, strlen(p.ssid));
-        copy_bounded(kiosk_config.wifi_pass, sizeof kiosk_config.wifi_pass, p.pass, strlen(p.pass));
+        config_net_add(p.ssid, p.pass);
         if (p.server[0]) set_server_base(p.server);
         if (p.mode[0]) kiosk_config.video_mode = (uint8_t)video_mode_from_name(p.mode);
         if (!config_save()) printf("warning: config verify failed\n");
-        printf("portal: saved wifi \"%s\", server %s\n", kiosk_config.wifi_ssid, kiosk_config.server_base);
+        printf("portal: saved wifi \"%s\" (%u known), server %s\n", p.ssid, kiosk_config.net_count, kiosk_config.server_base);
         // save_requested stays set so a second POST is refused; the reboot clears everything.
         reboot_at_ms = now + REBOOT_GRACE_MS;
         if (reboot_at_ms == 0) reboot_at_ms = 1;
@@ -1246,13 +1320,25 @@ void provision_poll(void) {
         return;
     }
 
-    if (!active) return;
+    // Scanning is no longer the portal's private business: the join manager needs to know which of
+    // the stored networks is actually in the room, and the screen shows what is nearby. So this
+    // runs whether or not the portal is up.
+    static bool scan_was_active;
+    bool running = scan_active();
+    if (scan_was_active && !running) {
+        nets_sort();
+        scan_done_ms = now;
+        scan_done_ever = true;
+    }
+    scan_was_active = running;
+
     if (scan_requested) {
-        bool run = !scan_active() && (!scan_ever || (uint32_t)(now - scan_started_ms) >= SCAN_MIN_INTERVAL_MS);
+        bool run = !running && (!scan_ever || (uint32_t)(now - scan_started_ms) >= SCAN_MIN_INTERVAL_MS);
         if (run) {
             scan_requested = false;
+            nets_n = 0;          // results are a snapshot of here and now, not a running tally
             scan_start();
-        } else if (scan_active()) {
+        } else if (running) {
             scan_requested = false;   // one is already running; its results land in the table
         }
     }

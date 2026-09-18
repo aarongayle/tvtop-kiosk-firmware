@@ -36,7 +36,9 @@ static wifi_state_t fake_wifi_state = WIFI_DOWN;
 
 void host_reboot_hook(void) { reboots++; }
 void host_scan_start_hook(void) { scans++; }
-const char *net_wifi_start_ap(void) { ap_starts++; return "TVTOP-1A2B"; }
+static bool last_ap_keep_station;
+const char *net_wifi_start_ap(bool keep_station) { ap_starts++; last_ap_keep_station = keep_station; return "TVTOP-1A2B"; }
+bool net_wifi_ap_is_concurrent(void) { return true; }
 void net_wifi_stop_ap(void) { ap_stops++; }
 wifi_state_t net_wifi_state(void) { return fake_wifi_state; }
 const char *net_wifi_ip(char *buf, size_t cap) { snprintf(buf, cap, "10.0.0.7"); return buf; }
@@ -210,7 +212,8 @@ static void test_routing(void) {
 
 static void test_config_json(void) {
     fresh_config();
-    strcpy(kiosk_config.wifi_ssid, "Caf\xc3\xa9 \"Quoted\"\\");
+    strcpy(kiosk_config.nets[0].ssid, "Caf\xc3\xa9 \"Quoted\"\\");
+    kiosk_config.net_count = 1;
     strcpy(kiosk_config.server_base, "http://192.168.1.10:8080");
     kiosk_config.video_mode = VIDEO_480P60;
     strcpy(ap_ssid, "TVTOP-1A2B");
@@ -341,22 +344,22 @@ static void test_save_apply_and_reboot(void) {
     CHECK(status_of(&c) == 200 && body_has(&c, "rebooting") && c.reboot_after);
     CHECK(save_requested);
     // Config is untouched until main context runs.
-    CHECK(kiosk_config.wifi_ssid[0] == 0);
+    CHECK(kiosk_config.nets[0].ssid[0] == 0);
     // A second POST while one is pending is refused.
     CHECK(feed(&c, req, 1000) == FEED_RESPOND);
     CHECK(status_of(&c) == 409);
 
     host_now_ms = 5000;
     provision_poll();
-    CHECK(strcmp(kiosk_config.wifi_ssid, "Home Net") == 0);
-    CHECK(strcmp(kiosk_config.wifi_pass, "p@ss word1") == 0);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "Home Net") == 0);
+    CHECK(strcmp(kiosk_config.nets[0].pass, "p@ss word1") == 0);
     CHECK(strcmp(kiosk_config.server_base, "http://192.168.1.10:8080") == 0);   // trailing slash stripped
     CHECK(kiosk_config.video_mode == VIDEO_480P60);
     CHECK(kiosk_config.token[0] == 0 && kiosk_config.next_url[0] == 0 && kiosk_config.device_id[0] == 0);   // new server → re-register
     // Written to flash and consistent.
     kiosk_config_t img;
     memcpy(&img, host_flash_sector, sizeof img);
-    CHECK(strcmp(img.wifi_ssid, "Home Net") == 0 && img.crc32 == crc32_update(0, &img, offsetof(kiosk_config_t, crc32)));
+    CHECK(strcmp(img.nets[0].ssid, "Home Net") == 0 && img.crc32 == crc32_update(0, &img, offsetof(kiosk_config_t, crc32)));
     // The host has no in-flight connections, so the reboot follows on the same/next poll.
     CHECK(reboots == 1);
     // Idempotent: further polls must not save again or reboot twice before the (fake) reboot.
@@ -377,7 +380,7 @@ static void test_save_apply_and_reboot(void) {
     CHECK(feed(&c, req, 1000) == FEED_RESPOND);
     CHECK(status_of(&c) == 200);
     provision_poll();
-    CHECK(strcmp(kiosk_config.wifi_ssid, "Other") == 0 && kiosk_config.wifi_pass[0] == 0);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "Other") == 0 && kiosk_config.nets[0].pass[0] == 0);
     CHECK(strcmp(kiosk_config.token, "keepme") == 0 && kiosk_config.next_url[0] != 0);
     save_requested = false;
     reboot_at_ms = 0;
@@ -388,13 +391,13 @@ static void test_start_stop_and_scan_pacing(void) {
     fresh_config();
     builtins = 0; ap_starts = 0; ap_stops = 0; scans = 0;
     scan_requested = false; scan_ever = false; scan_started_ms = 0;
-    provision_start();
+    provision_start(false);
     CHECK(provision_active());
     CHECK(ap_starts == 1);
     CHECK(strcmp(provision_ap_ssid(), "TVTOP-1A2B") == 0);
     CHECK(builtins == 1 && last_builtin == BUILTIN_PROVISION);
     CHECK(strcmp(last_builtin_arg1, "TVTOP-1A2B") == 0 && strcmp(last_builtin_arg2, "http://192.168.4.1") == 0);
-    provision_start();   // idempotent
+    provision_start(false);   // idempotent
     CHECK(ap_starts == 1 && builtins == 1);
     // The first poll starts a scan straight away; repeated requests are paced.
     host_now_ms = 10000;
@@ -411,12 +414,12 @@ static void test_start_stop_and_scan_pacing(void) {
     CHECK(!provision_active() && ap_stops == 1 && provision_ap_ssid()[0] == 0);
     provision_stop();
     CHECK(ap_stops == 1);
-    // Inactive: a stray scan request is ignored.
+    // Inactive: scans still run. The join manager needs to know which of the stored networks is
+    // actually in range while the portal is down, so scanning is no longer the portal's alone.
     scan_requested = true;
     host_now_ms += 100000;
     provision_poll();
-    CHECK(scans == 2);
-    scan_requested = false;
+    CHECK(scans == 3 && !scan_requested);
 }
 
 static void test_split_args(void) {
@@ -445,22 +448,22 @@ static void test_console(void) {
 
     char l1[] = "wifi \"My Home Net\" secret123";
     console_exec(l1);
-    CHECK(strcmp(kiosk_config.wifi_ssid, "My Home Net") == 0 && strcmp(kiosk_config.wifi_pass, "secret123") == 0);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "My Home Net") == 0 && strcmp(kiosk_config.nets[0].pass, "secret123") == 0);
     CHECK(restarts == 1);
     kiosk_config_t img;
     memcpy(&img, host_flash_sector, sizeof img);
-    CHECK(strcmp(img.wifi_ssid, "My Home Net") == 0);   // saved
+    CHECK(strcmp(img.nets[0].ssid, "My Home Net") == 0);   // saved
 
     char l2[] = "wifi OpenNet";
     console_exec(l2);
-    CHECK(strcmp(kiosk_config.wifi_ssid, "OpenNet") == 0 && kiosk_config.wifi_pass[0] == 0 && restarts == 2);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "OpenNet") == 0 && kiosk_config.nets[0].pass[0] == 0 && restarts == 2);
 
     char l3[] = "wifi Net short";   // rejected: no change, no restart
     console_exec(l3);
-    CHECK(strcmp(kiosk_config.wifi_ssid, "OpenNet") == 0 && restarts == 2);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "OpenNet") == 0 && restarts == 2);
     char l3b[] = "wifi 123456789012345678901234567890123 12345678";   // 33-char ssid
     console_exec(l3b);
-    CHECK(strcmp(kiosk_config.wifi_ssid, "OpenNet") == 0 && restarts == 2);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "OpenNet") == 0 && restarts == 2);
     char l3c[] = "wifi";
     console_exec(l3c);
     CHECK(restarts == 2);
@@ -498,15 +501,15 @@ static void test_console(void) {
     strcpy(kiosk_config.static_id, "s-1");
     char l9[] = "reset";
     console_exec(l9);
-    CHECK(kiosk_config.token[0] == 0 && kiosk_config.static_id[0] == 0 && strcmp(kiosk_config.wifi_ssid, "Again") == 0);
+    CHECK(kiosk_config.token[0] == 0 && kiosk_config.static_id[0] == 0 && strcmp(kiosk_config.nets[0].ssid, "Again") == 0);
     CHECK(restarts == 6);
 
     char l10[] = "factory";
     console_exec(l10);
-    CHECK(kiosk_config.wifi_ssid[0] == 0 && strcmp(kiosk_config.server_base, "https://kiosk.tvtop.games") == 0);
+    CHECK(kiosk_config.nets[0].ssid[0] == 0 && strcmp(kiosk_config.server_base, "https://kiosk.tvtop.games") == 0);
     CHECK(reboots == 2);
     memcpy(&img, host_flash_sector, sizeof img);
-    CHECK(img.wifi_ssid[0] == 0);
+    CHECK(img.nets[0].ssid[0] == 0);
 
     char l11[] = "reboot";
     console_exec(l11);
@@ -534,18 +537,18 @@ static void test_console_line_editing(void) {
     // "wifx" + backspace + "i Net 12345678" + CRLF (LF must not run an empty second command).
     const char *keys = "wifx\bi Nex\x7ft 12345678\r\n";   // BS and DEL both erase
     for (const char *k = keys; *k; k++) console_feed((unsigned char)*k);
-    CHECK(strcmp(kiosk_config.wifi_ssid, "Net") == 0 && restarts == 1);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "Net") == 0 && restarts == 1);
     // Bare LF line ends work too; control characters are dropped.
     const char *keys2 = "\x1b[Awifi\tLF2 12345678\n";
     for (const char *k = keys2; *k; k++) console_feed((unsigned char)*k);
-    CHECK(strcmp(kiosk_config.wifi_ssid, "LF2") == 0 && restarts == 2);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "LF2") == 0 && restarts == 2);
     // An over-long line is discarded whole, and the next line works.
     for (int i = 0; i < CONSOLE_LINE_MAX + 50; i++) console_feed('w');
     console_feed('\r');
     CHECK(restarts == 2);
     const char *keys3 = "wifi After 12345678\r";
     for (const char *k = keys3; *k; k++) console_feed((unsigned char)*k);
-    CHECK(strcmp(kiosk_config.wifi_ssid, "After") == 0 && restarts == 3);
+    CHECK(strcmp(kiosk_config.nets[0].ssid, "After") == 0 && restarts == 3);
 }
 
 int main(void) {
