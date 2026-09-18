@@ -37,6 +37,10 @@ static uint32_t backoff_ms = BACKOFF_MIN_MS;
 static TimerHandle_t retry_timer;
 static bool ap_on;
 static bool sntp_started;
+// esp_wifi_disconnect() raises STA_DISCONNECTED like any other drop. Without this, asking to join
+// a network schedules a retry for the disconnect we ourselves just caused — and that retry fires
+// after the join has succeeded and tears down a live connection. Seen mid-transfer on the bench.
+static bool self_disconnect;
 
 bool net_sta_up(void) { return state == MODEM_WIFI_UP; }
 
@@ -66,7 +70,7 @@ static void set_state(modem_wifi_state_t s) {
 
 static void retry_cb(TimerHandle_t t) {
     (void)t;
-    if (!have_creds) return;
+    if (!have_creds || state == MODEM_WIFI_UP) return;
     ESP_LOGI(TAG, "retrying join to \"%s\"", want_ssid);
     set_state(MODEM_WIFI_CONNECTING);
     esp_wifi_connect();
@@ -94,8 +98,14 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data) {
     case WIFI_EVENT_STA_START:
         if (have_creds) esp_wifi_connect();
         break;
+    case WIFI_EVENT_STA_CONNECTED:
+        // Any retry still pending belongs to an older attempt; letting it fire would disconnect
+        // the connection that just came up.
+        if (retry_timer) xTimerStop(retry_timer, 0);
+        break;
     case WIFI_EVENT_STA_DISCONNECTED: {
         wifi_event_sta_disconnected_t *d = data;
+        if (self_disconnect) { self_disconnect = false; break; }
         if (!have_creds) { set_state(MODEM_WIFI_DOWN); break; }
         ESP_LOGW(TAG, "disconnected from \"%s\" (reason %d)", want_ssid, d->reason);
         schedule_retry();
@@ -178,6 +188,7 @@ void net_connect(const char *ssid, const char *pass) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_LOGI(TAG, "joining \"%s\"", want_ssid);
     set_state(MODEM_WIFI_CONNECTING);
+    self_disconnect = true;
     esp_wifi_disconnect();
     esp_wifi_connect();
 }
@@ -185,6 +196,7 @@ void net_connect(const char *ssid, const char *pass) {
 void net_stop(void) {
     have_creds = false;
     if (retry_timer) xTimerStop(retry_timer, 0);
+    self_disconnect = true;
     esp_wifi_disconnect();
     set_state(MODEM_WIFI_DOWN);
 }

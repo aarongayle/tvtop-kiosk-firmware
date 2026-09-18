@@ -10,3 +10,11 @@ host/build/
 .DS_Store
 host/out/
 *.log
+
+# ESP-IDF generates these per target from sdkconfig.defaults; `idf.py set-target` rewrites them.
+modem/sdkconfig
+modem/sdkconfig.c2
+modem/sdkconfig.old
+modem/build*/
+modem/managed_components/
+modem/dependencies.lock

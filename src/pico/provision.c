@@ -623,6 +623,9 @@ static void print_help(void) {
            "  bench                    time the scanline expander\n"
            "  pads <2|4|8|12> [fast]   TMDS pad drive and slew\n"
            "  smps pwm|save            3V3 regulator mode\n"
+#ifndef PROVISION_HOST_TEST
+           "  portal                   start the provisioning AP and captive portal now\n"
+#endif
 #if KIOSK_MODEM
            "  modem [reset|boot]       restart the modem, or drop it into its ROM bootloader\n"
 #endif
@@ -674,6 +677,15 @@ static void console_exec(char *line) {
                    (unsigned long)m->rx_resyncs, (unsigned long)m->rx_overruns,
                    (unsigned long)m->tx_frames, (unsigned long)m->tx_bytes, (unsigned long)m->tx_full);
         }
+#endif
+#ifndef PROVISION_HOST_TEST
+    } else if (strcmp(cmd, "portal") == 0) {
+        // Brings the provisioning AP and the captive portal up without wiping the stored
+        // credentials, which `factory` would. The station drops when the AP starts, so the loop
+        // parks itself in wifi-wait; saving the form reboots as usual, and so does `reboot` if you
+        // only wanted a look.
+        if (provision_active()) { printf("portal: already running as \"%s\"\n", provision_ap_ssid()); return; }
+        provision_start();
 #endif
 #if KIOSK_MODEM
     } else if (strcmp(cmd, "modem") == 0) {

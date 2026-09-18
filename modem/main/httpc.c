@@ -27,6 +27,7 @@
 
 #define TAG "http"
 #define SOCKET_SLICE_MS 3000
+#define CONNECT_TIMEOUT_MS 10000
 #define MAX_REDIRECTS 3
 #define BODY_CHUNK (MODEM_MAX_PAYLOAD - 1)
 #define URL_MAX 256
@@ -74,7 +75,9 @@ static int16_t run(const req_t *r, uint16_t *out_status) {
     esp_http_client_config_t cfg = {
         .url = r->url,
         .method = HTTP_METHOD_GET,
-        .timeout_ms = SOCKET_SLICE_MS,
+        // Generous for DNS + TCP + the TLS handshake; dropped to SOCKET_SLICE_MS once the socket
+        // is open so that reads come back often enough to notice a cancel.
+        .timeout_ms = CONNECT_TIMEOUT_MS,
         .buffer_size = 1024,
         .buffer_size_tx = 1024,
         .disable_auto_redirect = true,     // followed here, so each hop is visible in the log
@@ -97,13 +100,26 @@ static int16_t run(const req_t *r, uint16_t *out_status) {
             err = e == ESP_ERR_HTTP_CONNECT ? MODEM_HTTP_ERR_CONNECT : MODEM_HTTP_ERR_DNS;
             goto out;
         }
-        if (esp_http_client_fetch_headers(c) < 0) { err = MODEM_HTTP_ERR_PROTOCOL; goto out; }
+        esp_http_client_set_timeout_ms(c, SOCKET_SLICE_MS);
+        // The response head is the part that keeps you waiting: the kiosk server parks a long poll
+        // for 25 seconds and sends nothing at all until it has a frame — not even headers. A slice
+        // timeout here is therefore the normal idle case, and esp_http_client_fetch_headers reports
+        // it as -ESP_ERR_HTTP_EAGAIN, which is not a failure. Only the overall deadline ends it.
+        for (;;) {
+            int64_t cl = esp_http_client_fetch_headers(c);
+            if (cl >= 0) break;
+            if (cl != -ESP_ERR_HTTP_EAGAIN) { err = MODEM_HTTP_ERR_PROTOCOL; goto out; }
+            if (cancelled) { err = MODEM_HTTP_ERR_ABORTED; goto out; }
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if ((int32_t)(now - deadline) >= 0) { err = MODEM_HTTP_ERR_TIMEOUT; goto out; }
+        }
         status = (uint16_t)esp_http_client_get_status_code(c);
         bool redirect = status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
         if (!redirect) break;
         if (++redirects > MAX_REDIRECTS) { err = MODEM_HTTP_ERR_TOO_MANY_REDIRECTS; goto out; }
         if (esp_http_client_set_redirection(c) != ESP_OK) { err = MODEM_HTTP_ERR_PROTOCOL; goto out; }
         esp_http_client_close(c);
+        esp_http_client_set_timeout_ms(c, CONNECT_TIMEOUT_MS);
     }
 
     {
@@ -113,9 +129,15 @@ static int16_t run(const req_t *r, uint16_t *out_status) {
         link_send(M_HTTP_STATUS, sbuf, sizeof sbuf);
     }
 
+    // Read first, ask whether the response is complete afterwards. esp_http_client_fetch_headers()
+    // reads whole segments, so for a small reply the body is already in the client's buffer *and*
+    // already counted against content-length: a loop that tests
+    // esp_http_client_is_complete_data_received() before its first read believes the body has been
+    // handled and never fetches those buffered bytes. That is exactly what a registration reply is
+    // — one 147-byte segment — and it arrived as a 200 with no body at all.
     static uint8_t chunk[1 + BODY_CHUNK];
     chunk[0] = r->id;
-    while (!esp_http_client_is_complete_data_received(c)) {
+    for (;;) {
         if (cancelled) { err = MODEM_HTTP_ERR_ABORTED; goto out; }
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
         if ((int32_t)(now - deadline) >= 0) { err = MODEM_HTTP_ERR_TIMEOUT; goto out; }
@@ -131,16 +153,23 @@ static int16_t run(const req_t *r, uint16_t *out_status) {
         if (n > 0) {
             credit -= (uint32_t)n;
             if (!link_send(M_HTTP_BODY, chunk, (uint16_t)(1 + n))) { err = MODEM_HTTP_ERR_ABORTED; goto out; }
-            continue;
-        }
-        if (n == 0) {
-            // Either the response is finished (the loop condition catches it) or the socket slice
-            // expired with nothing to read, which is the normal state of a parked long poll.
             if (esp_http_client_is_complete_data_received(c)) break;
             continue;
         }
+        if (esp_http_client_is_complete_data_received(c)) break;   // a 304 and friends: no body
+
+        // The documented signal for "the slice expired before any data was ready", which is the
+        // normal state of a parked long poll. The overall deadline above is what ends it.
+        if (n == -ESP_ERR_HTTP_EAGAIN) continue;
         int se = esp_http_client_get_errno(c);
-        if (se == EAGAIN || se == EWOULDBLOCK || se == 0) continue;   // slice timeout, not a failure
+        if (se == EAGAIN || se == EWOULDBLOCK) continue;
+        if (n == 0) {
+            // A short read that is not a timeout means the peer closed before content-length was
+            // satisfied. errno is not always conclusive here, so pause briefly rather than spin;
+            // the deadline still bounds it.
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
         ESP_LOGW(TAG, "read failed (errno %d)", se);
         err = MODEM_HTTP_ERR_CLOSED;
         goto out;

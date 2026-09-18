@@ -34,7 +34,7 @@ static char sta_ssid[33];
 static char sta_pass[65];
 static bool want_ap;
 static char ap_ssid[16];
-static bool was_ready;
+static uint32_t seen_session;   // the modem boot we have already configured
 
 static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
 
@@ -120,7 +120,7 @@ bool net_wifi_init(void) {
 #endif
     bool ok = modem_link_init();
     modem_link_set_handler(dispatch);
-    was_ready = modem_link_ready();
+    seen_session = modem_link_session();
     initted = true;
     state = WIFI_DOWN;
     return ok;
@@ -180,19 +180,21 @@ void net_wifi_poll(void) {
     if (!initted) return;
     modem_link_poll();
 
-    bool ready = modem_link_ready();
-    if (ready && !was_ready) {
-        // A modem that has just (re)started knows nothing. Replay what we wanted, and let the
-        // HTTP client and the portal relay abandon whatever they had in flight.
-        printf("modem: link up (%s); restoring state\n", modem_link_fw());
+    // A modem that has just (re)started knows nothing: it keeps no settings of its own, by design.
+    // The session id in its hello is what makes that visible — a crash, a brownout or a reflash
+    // leaves the link looking perfectly healthy otherwise, and the kiosk would wait for a join
+    // that nobody is attempting any more.
+    uint32_t session = modem_link_session();
+    if (session && session != seen_session) {
+        seen_session = session;
+        printf("modem: %s restarted; restoring state\n", modem_link_fw());
+        state = WIFI_DOWN;
         http_modem_on_modem_restart();
         portal_modem_on_modem_restart();
         if (want_sta) { state = WIFI_CONNECTING; send_connect(); }
         else if (want_ap) send_ap();
-    } else if (!ready && was_ready) {
-        state = WIFI_DOWN;
     }
-    was_ready = ready;
+    bool ready = modem_link_ready();
 
     // A modem that stops answering is indistinguishable from one that has crashed. Ping every few
     // seconds while idle so the link's frame counters keep moving and a dead modem is visible in

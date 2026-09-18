@@ -37,6 +37,7 @@ static uint32_t tx_inflight;
 static modem_handler_t handler;
 static modem_link_stats_t stats;
 static bool ready;
+static uint32_t session;   // the modem's boot id; a change means it restarted
 static char modem_fw[24];
 
 // ---- receive parser ---------------------------------------------------------------------------
@@ -195,21 +196,28 @@ void modem_link_set_handler(modem_handler_t h) { handler = h; }
 bool modem_link_ready(void) { return ready; }
 const char *modem_link_fw(void) { return modem_fw; }
 const modem_link_stats_t *modem_link_stats(void) { return &stats; }
+uint32_t modem_link_session(void) { return session; }
 
 // Consumed here rather than in net_modem.c because the link owns readiness: everything else waits
 // on modem_link_ready().
 static void on_hello(const uint8_t *p, uint16_t len) {
-    if (len < 9) return;
+    if (len < 13) return;
     if (p[0] != MODEM_PROTO_VERSION) {
         printf("modem: protocol version %u, expected %u\n", p[0], MODEM_PROTO_VERSION);
         return;
     }
-    uint8_t fw_len = p[8];
-    if (9u + fw_len > len) fw_len = (uint8_t)(len - 9u);
+    uint32_t sess;
+    memcpy(&sess, p + 8, 4);
+    uint8_t fw_len = p[12];
+    if (13u + fw_len > len) fw_len = (uint8_t)(len - 13u);
     if (fw_len > sizeof modem_fw - 1) fw_len = sizeof modem_fw - 1;
-    memcpy(modem_fw, p + 9, fw_len);
+    memcpy(modem_fw, p + 13, fw_len);
     modem_fw[fw_len] = 0;
     ready = true;
+    // The modem announces itself several times at start-up in case the host was not listening yet.
+    // Only a session it has not seen means "this modem has restarted and lost everything".
+    if (sess == session) return;
+    session = sess;
     printf("modem: %s fw %s, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
            p[1] == MODEM_CHIP_ESP32C2 ? "esp32-c2" : p[1] == MODEM_CHIP_ESP32C3 ? "esp32-c3" : "esp32",
            modem_fw, p[2], p[3], p[4], p[5], p[6], p[7]);
