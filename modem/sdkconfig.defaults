@@ -1,0 +1,27 @@
+# The TLS stack plus the Mozilla root bundle does not fit the default 1 MB app partition.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# HTTPS to the kiosk server is verified against ESP-IDF's bundled roots, so no certificate has to
+# be stored on the RP2350 or shipped in its image.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+
+# The portal needs a listener, up to three relayed connections, DNS, and the HTTP client's socket.
+CONFIG_LWIP_MAX_SOCKETS=12
+
+# Logs travel to the kiosk's USB console as M_LOG frames (link.c). Keeping them at info level makes
+# the link carry a few hundred bytes a minute, which is nothing next to a frame.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# A modem that wedges should come back on its own: the kiosk would otherwise sit on a stale frame
+# until someone power-cycles the stick.
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_ESP_INT_WDT=y
+
+# Nothing here is deep-sleep or RTC dependent, and the antenna is shared with a 744 Mbit/s TMDS
+# stream 20 mm away: keep the radio at full power rather than saving milliwatts.
+CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
+
+# The DevKitM-1 and the ESP8684-MINI-1-H4X/ESP32-C3-MINI-1-H4 modules all carry 4 MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
