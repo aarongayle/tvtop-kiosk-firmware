@@ -204,12 +204,17 @@ bool modem_flash_run(void) {
         uint32_t blocks = (clen + FLASH_BLOCK - 1u) / FLASH_BLOCK;
         // The ROM wants the erase size rounded up to whole write blocks, not the raw length.
         uint32_t erase = ((ulen + FLASH_BLOCK - 1u) / FLASH_BLOCK) * FLASH_BLOCK;
-        uint8_t begin[16];
+        // Five parameters, not four: every chip after the original ESP32 sets esptool's
+        // SUPPORTS_ENCRYPTED_FLASH, and its ROM expects a trailing "encrypted write" flag. Sending
+        // the four-word version gets error 0x05 — "the message is invalid" — which reads like bad
+        // arguments and is really the wrong length.
+        uint8_t begin[20];
         memcpy(begin, &erase, 4);
         memcpy(begin + 4, &blocks, 4);
         uint32_t bs = FLASH_BLOCK;
         memcpy(begin + 8, &bs, 4);
         memcpy(begin + 12, &h->esp_offset, 4);
+        memset(begin + 16, 0, 4);   // not an encrypted write
         printf("modem-flash: erasing...\n");
         // Erasing a megabyte takes the ROM several seconds, and the watchdog is 8 s, so the wait
         // inside slip_read feeds it.
