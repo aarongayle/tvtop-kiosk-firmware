@@ -254,7 +254,7 @@ into download mode, so a missing or truncated blob is caught early rather than h
 
 It is zlib-compressed — the ROM's `FLASH_DEFL_*` commands take deflate data and inflate it on the
 way in, so compressing costs the RP2350 nothing and roughly halves both the flash it occupies and
-its time on the wire: 1,076 KB of ESP image becomes 598 KB.
+its time on the wire: 881 KB of ESP image becomes 537 KB.
 
 **No stub loader is uploaded.** esptool normally pushes a small program into the ESP's RAM first
 because it is much faster, but that means carrying a second binary and keeping it in step with the
@@ -269,11 +269,33 @@ happens, the modem is left reset out of download mode, so a failed flash does no
 success is confirmed the only way that really counts: the modem boots and says hello, and the
 console prints the version that answered.
 
-### v3's flash budget
+### v3's flash budget, and what the modem image costs
 
-The RP2354A has 2 MB in total and the image is 598 KB, so that build has to place
-`KIOSK_MODEM_IMAGE_OFFSET` deliberately and the geometry cache gets what is left — roughly 750 KB
-rather than the 956 KB the v3 README assumes. Worth deciding before the boards arrive.
+The RP2354A has 2 MB in total, shared between the kiosk firmware, this image, the geometry cache
+and the config sector. Every kilobyte here is a kilobyte the cache does not get, and the cache is
+what decides how detailed a board can be held for offline redraw — so this is worth a look, but it
+is worth measuring first.
+
+Measured, the certificate bundle is **18 KB**: 1.8% of the app, not the place to save. Pinning it
+down to the roots the server happens to use today would recover about half of that and break every
+kiosk in the field the day the server's CA changes. It stays.
+
+What the space is actually in, and what `modem/sdkconfig.defaults` does about it:
+
+| | |
+|---|---|
+| **Optimise for size** | The ESP-IDF default is `-Og`. Nothing here is performance-critical — the radio's own work is in libraries built separately — and this alone is most of the saving. |
+| **Silent assertions** | They still fire and still halt; they stop carrying file, line and expression text. |
+| **No `esp_err_to_name` table** | Errors reach the kiosk console as numbers. A real but small loss against a large table. |
+| **No IPv6** | The protocol and the portal are v4 throughout. |
+| **No WPA2-Enterprise** | The portal collects an SSID and a password, which cannot join an enterprise network — those want an identity and often a certificate — so it could never have been used. A large part of wpa_supplicant. |
+
+Together: 1,076 KB → **881 KB** uncompressed, 598 KB → **537 KB** compressed. That leaves roughly
+810 KB for the geometry cache on a 2 MB part, against the 956 KB the v3 README assumes. The
+remaining bulk is irreducible — the Wi-Fi MAC (158 KB), lwIP (131 KB) and mbedTLS's crypto
+(99 KB) are the reason this chip is here at all.
+
+Flashing time barely moves (about fifteen seconds either way); the flash budget is the point.
 
 ## Still to do
 
