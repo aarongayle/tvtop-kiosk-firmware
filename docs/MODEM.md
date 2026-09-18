@@ -72,6 +72,13 @@ source ~/esp/esp-idf-v5.5.5/export.sh
 cd modem && idf.py set-target esp32c3 && idf.py -p /dev/cu.usbserial-XXXX flash monitor
 ```
 
+To check the v3 part builds without disturbing that, give it its own config — `set-target` rewrites
+the shared `sdkconfig`, and a stale one makes the next C3 flash refuse to run:
+
+```bash
+idf.py -B build-c2 -D SDKCONFIG=sdkconfig.c2 set-target esp32c2 build
+```
+
 Kiosk:
 
 ```bash
@@ -112,6 +119,20 @@ nothing on the UART can wait for it. Two mechanisms cover that:
   draining, the modem stops reading its socket, TCP's window closes, and the server waits. A 300 KB
   static set streams into the flash geometry cache with nothing buffered on either side.
 
+### Measured
+
+On the bring-up rig, streaming 250 KB frames continuously while the kiosk rendered 1080p30:
+
+| | |
+|---|---|
+| Sustained payload | **83.3 KB/s** (the 921600-baud 8N1 ceiling is 92.2 KB/s) |
+| Over 14.4 MB and 16,417 frames | **0** CRC errors, **0** resyncs, **0** ring overruns, **0** transmit stalls |
+| Video, same period | 15,638 frames, **0** missed lines, **0** dropped late lines |
+
+90% of line rate, with the remainder going to framing (8 bytes per 1024) and credit round-trips. A
+300 KB static set takes about 3.6 s at that rate. Raising the PCB link to `MODEM_BAUD_FAST` is the
+obvious lever if that ever matters.
+
 ### Messages
 
 Host → modem: `H_HELLO`, `H_PING`, `H_WIFI_CONNECT`, `H_WIFI_STOP`, `H_AP_START`, `H_AP_STOP`,
@@ -125,9 +146,13 @@ Modem → host: `M_HELLO`, `M_PONG`, `M_WIFI_STATE`, `M_SCAN_RESULT`, `M_SCAN_DO
 unchanged. `M_HTTP_HEADER` exists but is not sent: nothing on the kiosk reads response headers, and
 they would cost link time on every frame.
 
-The modem keeps **no** settings — no stored credentials, no server URL. It boots blank, and
-`net_modem.c` replays whatever was asked for whenever a fresh `M_HELLO` arrives, so a modem that
-crashes and restarts rejoins by itself and the kiosk above never notices.
+The modem keeps **no** settings — no stored credentials, no server URL. It boots blank, so the
+kiosk has to notice when it has restarted and tell it everything again. A quiet link is not the
+signal: a modem that crashes, browns out or is reflashed comes back with the UART looking perfectly
+healthy. `M_HELLO` therefore carries a `session` drawn afresh at each modem boot, and `net_modem.c`
+replays the station credentials or the AP when it sees a session it has not configured — once per
+modem boot, not once per hello, since the modem announces itself several times at start-up in case
+the kiosk was not listening yet.
 
 ## The captive portal
 
@@ -162,10 +187,28 @@ CRC, resync, overrun and transmit-full counts. A healthy link shows zeros across
 
 ```
 modem [reset|boot]
+portal
 ```
 
 `modem reset` restarts the modem firmware; `modem boot` releases it into its ROM bootloader so
-esptool — or, on v3, the RP2354A's own flasher — can reprogram it.
+esptool — or, on v3, the RP2354A's own flasher — can reprogram it. `portal` brings the provisioning
+AP and the captive portal up on demand, without `factory`'s side effect of wiping the credentials
+you would need to get back.
+
+## Two things that bite
+
+Both were found on the bench and are the reason the ESP code looks the way it does.
+
+- **`esp_http_client_fetch_headers()` blocks until the response head arrives**, and the kiosk
+  server parks a long poll for up to 25 s without sending so much as a status line. With a short
+  socket timeout it returns `-ESP_ERR_HTTP_EAGAIN`, which is a timeout and not a failure: it has to
+  be retried against the request's own deadline. Treating it as an error makes every idle long poll
+  fail — and a dev server that always answers immediately hides it completely.
+- **Read before asking whether the response is complete.** `fetch_headers` reads whole segments, so
+  a small reply is already sitting in the client's buffer *and* already counted against
+  content-length. A loop that tests `esp_http_client_is_complete_data_received()` first concludes
+  the body has been dealt with and never fetches those bytes. A registration reply is one 147-byte
+  segment, and it arrived as a 200 with no body at all.
 
 ## Still to do
 

@@ -54,7 +54,12 @@ enum {
 
 // ---- modem → host (RP2350) -------------------------------------------------------------------
 enum {
-    M_HELLO         = 0x81,   // u8 version, u8 chip, u8 mac[6], u8 fw_len, fw
+    // u8 version, u8 chip, u8 mac[6], u32 session, u8 fw_len, fw.
+    // `session` is drawn afresh every time the modem boots. It is how the host tells "the modem I
+    // have been talking to" from "a modem that has just restarted and forgotten everything": the
+    // modem re-announces itself several times at start-up, and the host must replay its state for
+    // a new session exactly once, not once per hello.
+    M_HELLO         = 0x81,
     M_PONG          = 0x82,   // —
     M_WIFI_STATE    = 0x90,   // u8 state (modem_wifi_state_t), u32 ip, i8 rssi, u8 channel
     M_SCAN_RESULT   = 0x91,   // i16 rssi, u8 open, u8 ssid_len, ssid

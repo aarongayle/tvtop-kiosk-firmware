@@ -56,6 +56,9 @@ bool modem_link_send2(uint8_t type, const void *a, uint16_t alen, const void *b,
 uint16_t modem_link_tx_room(void);
 
 bool modem_link_ready(void);          // M_HELLO received and the version matched
+// The modem's boot id, from its hello. It changes only when the modem has restarted, which is the
+// signal to replay everything it was told — it keeps no settings of its own. 0 until the first hello.
+uint32_t modem_link_session(void);
 const char *modem_link_fw(void);      // modem firmware version string, "" until hello
 void modem_link_reset(bool bootloader);   // pulse EN, optionally with IO9 held low
 

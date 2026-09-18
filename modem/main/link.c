@@ -7,6 +7,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -35,6 +36,17 @@ static int (*prev_vprintf)(const char *, va_list);
 
 static int log_vprintf(const char *fmt, va_list ap) {
     if (!log_q) return prev_vprintf ? prev_vprintf(fmt, ap) : 0;
+#if MODEM_LINK_UART != 0
+    // The bring-up rig has the link on UART1, so the DevKit's own USB console is free and keeping
+    // the log on it as well is worth the duplication. On v3 the link *is* UART0: writing there
+    // would inject text straight into the frame stream, so the link is the only copy.
+    if (prev_vprintf) {
+        va_list copy;
+        va_copy(copy, ap);
+        prev_vprintf(fmt, copy);
+        va_end(copy);
+    }
+#endif
     log_line_t line;
     int n = vsnprintf(line.text, sizeof line.text, fmt, ap);
     if (n <= 0) return n;
@@ -108,7 +120,10 @@ bool link_send(uint8_t type, const void *payload, uint16_t len) {
 }
 
 void link_send_hello(void) {
-    uint8_t buf[9 + 16];
+    // Drawn once per boot: the host replays its state when it sees a session it does not know.
+    static uint32_t session;
+    if (!session) session = esp_random() | 1u;
+    uint8_t buf[13 + 16];
     buf[0] = MODEM_PROTO_VERSION;
 #if CONFIG_IDF_TARGET_ESP32C2
     buf[1] = MODEM_CHIP_ESP32C2;
@@ -118,12 +133,13 @@ void link_send_hello(void) {
     buf[1] = MODEM_CHIP_UNKNOWN;
 #endif
     esp_read_mac(buf + 2, ESP_MAC_WIFI_STA);
+    memcpy(buf + 8, &session, 4);
     const char *fw = MODEM_FW_VERSION;
     uint8_t n = (uint8_t)strlen(fw);
     if (n > 16) n = 16;
-    buf[8] = n;
-    memcpy(buf + 9, fw, n);
-    link_send(M_HELLO, buf, (uint16_t)(9 + n));
+    buf[12] = n;
+    memcpy(buf + 13, fw, n);
+    link_send(M_HELLO, buf, (uint16_t)(13 + n));
 }
 
 // ---- receive ------------------------------------------------------------------------------------
