@@ -2,9 +2,37 @@
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 
 # HTTPS to the kiosk server is verified against ESP-IDF's bundled roots, so no certificate has to
-# be stored on the RP2350 or shipped in its image.
+# be stored on the RP2350 or shipped in its image. The "common" subset is ~18 KB — not worth
+# pinning down to the handful of roots the server uses today, which would save about half of that
+# and break every kiosk in the field the day the server's CA changes.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+
+# --- Size ---
+#
+# The image is written to the modem over a UART and, on v3, stored in the RP2354A's 2 MB flash
+# alongside the kiosk firmware and the geometry cache. Every kilobyte here is a kilobyte the
+# geometry cache does not get, which is the real cost: it decides how detailed a board can be
+# cached for offline redraw.
+
+# The default is -Og. This is the single biggest lever by a distance, and nothing here is
+# performance-critical enough to care — the radio's own work happens in libraries built separately.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# Assertions still fire and still halt; they just stop carrying their file, line and expression
+# text. Keeping the check and dropping the string is the right trade for a headless device.
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+# esp_err_to_name's full string table. Errors reaching the kiosk console as numbers is a real but
+# small loss, and the table is large.
+CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
+
+# The kiosk speaks IPv4 to the server and hands out IPv4 on the setup AP; nothing in the protocol
+# or the portal is v6-aware.
+CONFIG_LWIP_IPV6=n
+
+# WPA2-Enterprise (802.1X). The portal collects an SSID and a password, which is not enough to join
+# an enterprise network — those want an identity, often a certificate — so this could never be
+# used, and it is a large part of wpa_supplicant.
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
 
 # The portal needs a listener, up to three relayed connections, DNS, and the HTTP client's socket.
 CONFIG_LWIP_MAX_SOCKETS=12
