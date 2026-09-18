@@ -40,21 +40,34 @@ PiCowBell takes GPIO3, 4/5 (DDC), 6/7 (USB host) and 12–19 (HSTX). What is lef
 
 | Pico 2 W | Pin | | ESP pin | ESP GPIO | Purpose |
 |---|---|---|---|---|---|
-| GP8 (UART1 TX) | 11 | → | **IO6** (J3-9) | GPIO6 | data to the modem |
-| GP9 (UART1 RX) | 12 | ← | **IO7** (J3-8) | GPIO7 | data from the modem |
-| GND | 13 | — | **GND** (J3-7) | — | common ground |
+| GP8 (UART1 TX) | 11 | → | **RX** (J3-3) | GPIO20 | data to the modem |
+| GP9 (UART1 RX) | 12 | ← | **TX** (J3-2) | GPIO21 | data from the modem |
+| GND | 13 | — | **GND** (J3-4) | — | common ground |
 | GP10 | 14 | → | **RST** (J1-7) | CHIP_PU | modem reset |
 | GP11 | 15 | → | **IO9** (J3-5) | GPIO9 | boot strap |
+| VBUS | 40 | → | **5V** (J1-13) | — | power, so one USB cable runs both |
 
-**Power each board from its own USB cable.** Espressif's DevKitM-1 guide calls its three supplies
-(USB, the 5V pins, the 3V3 pins) mutually exclusive, and keeping the ESP on its own USB gives you
-its serial monitor while the link is running.
+**One cable, into the Pico.** VBUS is upstream of the Pico's regulator and the ESP's own LDO makes
+3.3 V from it. Do not use the Pico's 3V3 pin instead: its regulator has nowhere near the headroom
+for the ESP's ~350 mA transmit peaks on top of a 372 MHz RP2350 driving HSTX.
 
-**The link is not on the ESP's UART0 here.** On the DevKitM-1, UART0 (IO20/21) also goes to the
-onboard CP2102N, so with the ESP's USB plugged in the bridge's transmitter and the Pico's would
-both be driving IO20. IO6/IO7 sidesteps that entirely. To test the v3 arrangement instead, unplug
-the ESP's USB, power it from the Pico's VBUS, and build the modem with
-`idf.py -DMODEM_LINK_UART=0 -DMODEM_LINK_TX_PIN=21 -DMODEM_LINK_RX_PIN=20 build`.
+**Never power it both ways at once.** On the DevKitM-1 the 5V pin and the USB connector are the
+same net — that is what Espressif means by the supplies being mutually exclusive — so bridging two
+USB ports through it is the one genuinely bad outcome. Pull the ESP's cable before adding the 5V
+wire.
+
+**The link is on the ESP's UART0, as on v3.** That is what lets the kiosk reflash the modem
+(below), because UART0 is also the ROM bootloader. It is only possible with the ESP's USB
+unplugged: the DevKitM-1 wires UART0 to its onboard CP2102N as well, and with a cable in, the
+bridge's transmitter and the Pico's would both be driving IO20. Build the modem to match:
+
+```bash
+cd modem && idf.py -B build-uart0 -DMODEM_LINK_UART=0 -DMODEM_LINK_TX_PIN=21 -DMODEM_LINK_RX_PIN=20 build
+```
+
+If you would rather keep the ESP's own USB console during a debugging session, move the two data
+wires back to **IO6** (J3-9) and **IO7** (J3-8), drop the 5V wire, plug the ESP in, and build
+without those three options. The kiosk cannot flash the modem in that arrangement.
 
 RST and IO9 are driven **open-drain** by the RP2350 — released is high-impedance, asserted is low —
 so they do not fight the DevKit's RST/BOOT buttons or the CP2102N's auto-reset transistors. All
@@ -210,12 +223,60 @@ Both were found on the bench and are the reason the ESP code looks the way it do
   the body has been dealt with and never fetches those bytes. A registration reply is one 147-byte
   segment, and it arrived as a 200 with no body at all.
 
+## Flashing the modem from the kiosk
+
+v3 has one USB-C port and it goes to the RP2354A. The modem is programmed through it, by the kiosk,
+over the same UART they talk on — which is why the link is on the modem's UART0, that being also
+its ROM bootloader. So "pre-flashed" production means flashing one image, and a modem whose
+firmware will not boot, or cannot talk to us at all, is still recoverable without opening anything.
+
+Build the image and install it:
+
+```bash
+python3 tools/mkmodemimg.py modem/build-uart0 --out build-modem/modem-image.bin --uf2
+```
+
+```bash
+picotool load -f build-modem/modem-image.bin.uf2 && picotool load -f build-modem/tvtop_kiosk.uf2
+```
+
+Then, on the kiosk console:
+
+```
+modem flash
+```
+
+The image is **not linked into the firmware**. It lives in its own flash region
+(`KIOSK_MODEM_IMAGE_OFFSET`, 2 MB by default) installed by its own UF2, so the two are built and
+flashed independently and a modem update does not mean relinking the kiosk. `modem image` reports
+what is installed; the header carries a CRC of the payload, checked before the modem is ever put
+into download mode, so a missing or truncated blob is caught early rather than half-written.
+
+It is zlib-compressed — the ROM's `FLASH_DEFL_*` commands take deflate data and inflate it on the
+way in, so compressing costs the RP2350 nothing and roughly halves both the flash it occupies and
+its time on the wire: 1,076 KB of ESP image becomes 598 KB.
+
+**No stub loader is uploaded.** esptool normally pushes a small program into the ESP's RAM first
+because it is much faster, but that means carrying a second binary and keeping it in step with the
+chip. The ROM alone can attach the flash, take compressed data and reboot, and at 921600 baud
+(negotiated up from the ROM's 115200 with `CHANGE_BAUDRATE`) the whole image takes about fifteen
+seconds. For something done at the factory and occasionally in the field, a second binary is not
+worth it.
+
+The kiosk's own framing is switched off for the duration — `modem_link_raw_mode()` — because the
+ROM speaks SLIP, not our protocol. The receive DMA keeps running underneath either way. Whatever
+happens, the modem is left reset out of download mode, so a failed flash does not strand it, and
+success is confirmed the only way that really counts: the modem boots and says hello, and the
+console prints the version that answered.
+
+### v3's flash budget
+
+The RP2354A has 2 MB in total and the image is 598 KB, so that build has to place
+`KIOSK_MODEM_IMAGE_OFFSET` deliberately and the geometry cache gets what is left — roughly 750 KB
+rather than the 956 KB the v3 README assumes. Worth deciding before the boards arrive.
+
 ## Still to do
 
-- **The flasher.** v3's plan is that the RP2354A carries the modem image inside its own firmware
-  and writes it over the UART with the esptool protocol, so one USB-C port programs the whole
-  board. `modem boot` already puts the modem in the right state; the stub loader and the write
-  loop are not written yet.
 - **2 Mbaud on the PCB.** `MODEM_BAUD_FAST` is defined and 20 mm of trace should take it; the
   dupont rig is left at 921600.
 - **`KIOSK_MODEM` on the RP2040.** Untested and pointless — the Pico W build keeps its cyw43 — but

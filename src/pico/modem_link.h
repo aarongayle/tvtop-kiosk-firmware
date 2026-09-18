@@ -62,6 +62,17 @@ uint32_t modem_link_session(void);
 const char *modem_link_fw(void);      // modem firmware version string, "" until hello
 void modem_link_reset(bool bootloader);   // pulse EN, optionally with IO9 held low
 
+// --------------- Raw mode, for flashing the modem ---------------
+//
+// The ESP ROM bootloader speaks its own SLIP protocol, not ours, so the flasher takes the UART over
+// for the duration: the framing parser is switched off and bytes are read and written whole. The
+// receive DMA keeps running underneath either way.
+void modem_link_raw_mode(bool on);
+void modem_link_set_baud(uint32_t baud);
+void modem_link_raw_write(const uint8_t *data, size_t len);   // blocks until the UART has taken it
+int modem_link_raw_getc(uint32_t timeout_ms);                 // next byte, or -1 on timeout
+void modem_link_raw_purge(void);                              // drop anything already received
+
 // Counters for the `stats` console command.
 typedef struct {
     uint32_t rx_frames, rx_bytes, rx_crc_errors, rx_resyncs, rx_overruns;

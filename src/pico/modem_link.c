@@ -35,6 +35,7 @@ static uint32_t tx_head, tx_tail;    // monotonic
 static uint32_t tx_inflight;
 
 static modem_handler_t handler;
+static bool raw_mode;
 static modem_link_stats_t stats;
 static bool ready;
 static uint32_t session;   // the modem's boot id; a change means it restarted
@@ -244,6 +245,7 @@ static void drain_rx(void) {
     // main-loop iteration and keeping the HTTP window below the ring size makes a lap impossible;
     // a near-full ring is still worth counting, because it means the margin has gone.
     if (avail > MODEM_RX_RING_BYTES - 512u) stats.rx_overruns++;
+    if (raw_mode) return;   // the flasher reads the ring itself, byte at a time
     for (uint32_t i = 0; i < avail; i++)
         parse_byte(rx_ring[(rx_tail + i) & (MODEM_RX_RING_BYTES - 1u)]);
     rx_tail += avail;
@@ -252,6 +254,48 @@ static void drain_rx(void) {
 void modem_link_poll(void) {
     drain_rx();
     tx_kick();
+}
+
+// ---- raw mode ---------------------------------------------------------------------------------
+
+void modem_link_raw_mode(bool on) {
+    raw_mode = on;
+    parse_reset(false);
+    if (!on) modem_link_raw_purge();
+}
+
+void modem_link_set_baud(uint32_t baud) {
+    uart_set_baudrate(MODEM_UART, baud);
+}
+
+void modem_link_raw_write(const uint8_t *data, size_t len) {
+    // Straight at the UART rather than through the transmit ring: in raw mode nothing else is
+    // sending, and the flasher wants each block on the wire before it waits for the reply.
+    uart_write_blocking(MODEM_UART, data, len);
+}
+
+// The DMA ring is still filling; this is just its consumer while the parser is off.
+int modem_link_raw_getc(uint32_t timeout_ms) {
+    uint32_t deadline = to_ms_since_boot(get_absolute_time()) + timeout_ms;
+    for (;;) {
+        uint32_t idx = (uint32_t)((uintptr_t)dma_hw->ch[rx_dma].write_addr - (uintptr_t)rx_ring);
+        idx &= MODEM_RX_RING_BYTES - 1u;
+        if (idx != (rx_tail & (MODEM_RX_RING_BYTES - 1u))) {
+            uint8_t b = rx_ring[rx_tail & (MODEM_RX_RING_BYTES - 1u)];
+            rx_tail++;
+            rx_head_idx = idx;
+            return b;
+        }
+        if ((int32_t)(to_ms_since_boot(get_absolute_time()) - deadline) >= 0) return -1;
+        tight_loop_contents();
+    }
+}
+
+void modem_link_raw_purge(void) {
+    uint32_t idx = (uint32_t)((uintptr_t)dma_hw->ch[rx_dma].write_addr - (uintptr_t)rx_ring);
+    idx &= MODEM_RX_RING_BYTES - 1u;
+    rx_tail += (idx - (rx_tail & (MODEM_RX_RING_BYTES - 1u))) & (MODEM_RX_RING_BYTES - 1u);
+    rx_head_idx = idx;
 }
 
 bool modem_link_init(void) {
