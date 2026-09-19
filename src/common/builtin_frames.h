@@ -8,6 +8,12 @@ typedef enum {
     BUILTIN_CONNECTING,    // arg1 = Wi-Fi ssid
     BUILTIN_REGISTERING,   // no args
     BUILTIN_NO_TLS,        // arg1 = the https URL we cannot fetch
+    // arg1 = the setup AP's ssid, or "" while the kiosk is still only searching.
+    // arg2 = a newline-separated block drawn as a stack of lines: what it is looking for, what it
+    // can see. The caller composes it because only the caller knows both lists.
+    BUILTIN_WIFI_SETUP,
+    // arg1 = the network it joined, arg2 = newline-separated lines explaining what is wrong.
+    BUILTIN_NO_INTERNET,
     BUILTIN_TEST_PATTERN,  // colour bars + text, for bring-up
     BUILTIN_SOLID,         // three flat colour bands, no text: near-zero encode cost (signal-integrity check)
     BUILTIN_LABEL,         // the same bands with arg1 in large type (signal sweep step labels)

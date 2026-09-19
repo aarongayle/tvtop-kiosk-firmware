@@ -4,8 +4,17 @@ cmake_minimum_required(VERSION 3.13)
 set(PICO_BOARD pico_w CACHE STRING "pico_w | pico2_w")
 option(KIOSK_TLS "Build HTTPS (mbedTLS) support" OFF)
 option(KIOSK_NO_RADIO "Diagnostic build: never start the Wi-Fi radio" OFF)
-set(KIOSK_VIDEO_MODE "" CACHE STRING "Default video mode until one is stored. Pico W: 720p30 | 720p30rb | 480p60 | 720x480p60 | 960x540p60 | 1066x600p50 (default 720p30). Pico 2 W: 720p60 | 960x540p60 | 480p60 (default 720p60)")
+# v3 replaces the on-board radio with an ESP32 module on a UART: the modem owns Wi-Fi, the IP
+# stack and TLS, and this firmware talks to it through src/pico/modem_link.c. Also buildable on a
+# Pico 2 W wired to an ESP32-C3 DevKit (docs/MODEM.md), which is how it is developed.
+option(KIOSK_MODEM "Use an ESP32 modem over UART instead of the on-board cyw43 radio" OFF)
+set(KIOSK_VIDEO_MODE "" CACHE STRING "Default video mode until one is stored. Pico W (RP2040): 720p30 | 720p30rb | 480p60 | 720x480p60 | 960x540p60 | 1066x600p50 (default 720p30). Pico 2 W (RP2350): 720p60 | 1080p30 | 1080p25 | 1080p24 | 960x540p60 | 480p60 (default 720p60)")
 set(KIOSK_SERVER_BASE "https://kiosk.tvtop.games" CACHE STRING "Default kiosk server base URL")
+# Whether a network really reaches the internet is decided by fetching this and expecting 204 with
+# no body; anything else means something is answering on the network's behalf (a sign-in portal).
+# It must be plain HTTP — a portal cannot intercept TLS, it can only break it, which is
+# indistinguishable from the server being down. The kiosk sends this to the modem per probe.
+set(KIOSK_NET_CHECK_URL "" CACHE STRING "Connectivity probe URL (default: Google's generate_204)")
 set(KIOSK_WIFI_SSID "" CACHE STRING "Optional compiled-in Wi-Fi SSID (provisioning otherwise)")
 set(KIOSK_WIFI_PASSWORD "" CACHE STRING "Optional compiled-in Wi-Fi password")
 
@@ -55,10 +64,18 @@ if (KIOSK_HSTX)
 else()
     list(FILTER KIOSK_PICO_SRC EXCLUDE REGEX "/(scanout_hstx\\.c|hstx_line\\.c)$")
 endif()
+# The two network backends are mutually exclusive: each provides net_wifi.h and http_client.h.
+if (KIOSK_MODEM)
+    list(FILTER KIOSK_PICO_SRC EXCLUDE REGEX "/(net_wifi\\.c|http_client\\.c)$")
+    set(KIOSK_NET_SRC "")   # DHCP and DNS servers live on the modem
+else()
+    list(FILTER KIOSK_PICO_SRC EXCLUDE REGEX "/(net_modem\\.c|http_modem\\.c|modem_link\\.c|modem_flash\\.c)$")
+    set(KIOSK_NET_SRC
+        vendor/pico-examples/dhcpserver/dhcpserver.c
+        vendor/pico-examples/dnsserver/dnsserver.c)
+endif()
 
-add_executable(tvtop_kiosk ${KIOSK_COMMON_SRC} ${KIOSK_PICO_SRC}
-    vendor/pico-examples/dhcpserver/dhcpserver.c
-    vendor/pico-examples/dnsserver/dnsserver.c)
+add_executable(tvtop_kiosk ${KIOSK_COMMON_SRC} ${KIOSK_PICO_SRC} ${KIOSK_NET_SRC})
 
 target_include_directories(tvtop_kiosk PRIVATE
     src/common src/pico vendor/pico-examples/dhcpserver vendor/pico-examples/dnsserver)
@@ -73,6 +90,8 @@ string(REPLACE "_" "-" KIOSK_MODEL "${PICO_BOARD}")
 
 target_compile_definitions(tvtop_kiosk PRIVATE
     CYW43_PIO_CLOCK_DIV_DYNAMIC=1 # SPI divider chosen at runtime from the overclocked sys clock
+    KIOSK_MODEM=$<BOOL:${KIOSK_MODEM}>
+    $<$<BOOL:${KIOSK_NET_CHECK_URL}>:MODEM_NET_CHECK_URL="${KIOSK_NET_CHECK_URL}">
     KIOSK_MODEL="${KIOSK_MODEL}"
     KIOSK_TLS=$<BOOL:${KIOSK_TLS}>
     KIOSK_NO_RADIO=$<BOOL:${KIOSK_NO_RADIO}>
@@ -111,8 +130,12 @@ endif()
 
 target_link_libraries(tvtop_kiosk
     pico_stdlib pico_multicore pico_util pico_rand pico_unique_id
-    hardware_dma hardware_pio hardware_vreg hardware_flash hardware_xip_cache hardware_sync hardware_irq hardware_clocks
-    pico_cyw43_arch_lwip_threadsafe_background)
+    hardware_dma hardware_pio hardware_vreg hardware_flash hardware_xip_cache hardware_sync hardware_irq hardware_clocks)
+if (KIOSK_MODEM)
+    target_link_libraries(tvtop_kiosk hardware_uart)
+else()
+    target_link_libraries(tvtop_kiosk pico_cyw43_arch_lwip_threadsafe_background)
+endif()
 if (NOT KIOSK_HSTX)
     target_link_libraries(tvtop_kiosk hardware_pwm hardware_interp libdvi)
 endif()

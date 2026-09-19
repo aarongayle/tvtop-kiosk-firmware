@@ -46,6 +46,35 @@ static const char *icon_row(void) {
            "[\"i\",940,560,60,\"wifi\",\"" INK "\"],[\"i\",1040,560,60,\"warning\",\"" ACCENT "\"]";
 }
 
+// Emits one centred text op per line of a newline-separated block, stepping down the screen.
+// Lines are escaped individually; a line starting with '>' is drawn in the accent colour, which is
+// how the caller marks the thing it wants read first.
+static size_t line_stack(char *out, size_t cap, const char *text, int y, int step, int size) {
+    size_t n = 0;
+    const char *p = text;
+    while (*p && n + 96 < cap) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        char raw[160], esc[300];
+        if (len >= sizeof raw) len = sizeof raw - 1;
+        memcpy(raw, p, len);
+        raw[len] = 0;
+        const char *body = raw;
+        const char *colour = DIM;
+        if (raw[0] == '>') { body = raw + 1; colour = ACCENT; }
+        json_escape(body, esc, sizeof esc);
+        int w = snprintf(out + n, cap - n, "%s[\"t\",640,%d,\"%s\",%d,\"%s\",1]",
+                         n ? "," : "", y, esc, size, colour);
+        if (w < 0 || (size_t)w >= cap - n) break;
+        n += (size_t)w;
+        y += step;
+        if (!nl) break;
+        p = nl + 1;
+    }
+    out[n] = 0;
+    return n;
+}
+
 size_t builtin_frame_json(builtin_frame_t which, char *buf, size_t cap, const char *arg1, const char *arg2) {
     char a1[300], a2[300];
     json_escape(arg1, a1, sizeof a1);
@@ -73,6 +102,46 @@ size_t builtin_frame_json(builtin_frame_t which, char *buf, size_t cap, const ch
             "[\"t\",640,650,\"TV-Top Kiosk " KIOSK_FW_VERSION "\",22,\"" FAINT "\",1]"
             "]}", a1);
         break;
+    case BUILTIN_WIFI_SETUP: {
+        // One screen covers both halves of the problem: a kiosk that has never been set up, and one
+        // that travelled and cannot find anything it knows. The difference is only whether there is
+        // an AP to join yet, so the same layout serves and nothing flashes between states.
+        char lines[1400];
+        line_stack(lines, sizeof lines, arg2, 300, 46, 28);
+        if (arg1[0]) {
+            n = snprintf(buf, cap,
+                "{\"v\":3,\"next_url\":null,\"next_ms\":0,\"w\":1280,\"h\":720,\"bg\":\"" BG "\",\"ops\":["
+                "[\"i\",604,50,64,\"wifi\",\"" DIM "\"],"
+                "[\"t\",640,190,\"Set up Wi-Fi\",48,\"" INK "\",1,1],"
+                "%s%s"
+                "[\"t\",640,560,\"On your phone join\",26,\"" DIM "\",1],"
+                "[\"t\",640,616,\"%s\",44,\"" ACCENT "\",1,1],"
+                "[\"t\",640,672,\"then open http://192.168.4.1\",24,\"" FAINT "\",1]"
+                "]}", lines, lines[0] ? "," : "", a1);
+        } else {
+            n = snprintf(buf, cap,
+                "{\"v\":3,\"next_url\":null,\"next_ms\":0,\"w\":1280,\"h\":720,\"bg\":\"" BG "\",\"ops\":["
+                "[\"i\",604,50,64,\"wifi\",\"" DIM "\"],"
+                "[\"t\",640,190,\"Looking for Wi-Fi\",48,\"" INK "\",1,1],"
+                "%s%s"
+                "[\"t\",640,672,\"TV-Top Kiosk " KIOSK_FW_VERSION "\",22,\"" FAINT "\",1]"
+                "]}", lines, lines[0] ? "," : "");
+        }
+        break;
+    }
+    case BUILTIN_NO_INTERNET: {
+        char lines[1000];
+        line_stack(lines, sizeof lines, arg2, 400, 46, 28);
+        n = snprintf(buf, cap,
+            "{\"v\":3,\"next_url\":null,\"next_ms\":0,\"w\":1280,\"h\":720,\"bg\":\"" BG "\",\"ops\":["
+            "[\"i\",604,80,72,\"warning\",\"" ACCENT "\"],"
+            "[\"t\",640,230,\"No internet on this network\",46,\"" INK "\",1,1],"
+            "[\"t\",640,310,\"%s\",38,\"" ACCENT "\",1,1],"
+            "%s%s"
+            "[\"t\",640,672,\"Join TVTOP setup Wi-Fi to pick another network\",22,\"" FAINT "\",1]"
+            "]}", a1, lines, lines[0] ? "," : "");
+        break;
+    }
     case BUILTIN_REGISTERING:
         n = snprintf(buf, cap,
             "{\"v\":3,\"next_url\":null,\"next_ms\":0,\"w\":1280,\"h\":720,\"bg\":\"" BG "\",\"ops\":["
