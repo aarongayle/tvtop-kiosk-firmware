@@ -5,6 +5,8 @@ Firmware that turns a Raspberry Pi Pico 2 W into an HDMI games console for
 everyone plays from their own phone. The kiosk joins your Wi-Fi, pairs with the TV-Top server, and
 draws whatever the current game sends it.
 
+![A television showing a Frontier Island reference screen, driven by the Pico on the stand below](docs/images/kiosk-on-tv.jpg)
+
 It outputs **1920x1080 at 30 Hz in full 8-bit-per-channel colour**, with no framebuffer and no
 external video hardware. A 1080p frame at 24 bit is almost 6 MB and the RP2350 has 520 KB, so there
 is no frame in memory at all. Each scanline is built as a run-length HSTX command stream just
@@ -29,6 +31,10 @@ There are two configurations, matching the two revisions of the custom board:
 Option 1 is the simpler build. Option 2 moves Wi-Fi, the IP stack and TLS onto the ESP32, which is
 what the v3 board does and what the 1080p work is developed on. Wiring and the ESP-IDF build are
 in [docs/MODEM.md](docs/MODEM.md).
+
+![A Pico 2 W wired to an ESP32-C3 DevKitM-1, with an HDMI cable between them](docs/images/bring-up-rig.jpg)
+
+*Option 2 on the bench: a Pico 2 W and an ESP32-C3 DevKitM-1, with the HSTX DVI breakout between the Pico and the HDMI cable.*
 
 A Pico W (RP2040) also runs this firmware, driving DVI from PIO instead of HSTX, but it tops out
 well below 1080p.

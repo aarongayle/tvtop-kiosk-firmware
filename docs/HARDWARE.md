@@ -2,6 +2,10 @@
 
 ## Wiring
 
+![The Adafruit HSTX DVI Output PiCowbell with a mini HDMI cable attached, wired to an ESP32-C3 DevKitM-1](images/hstx-dvi-wiring.jpg)
+
+*The breakout this was developed on, with its pin assignment printed on it: HSTX pins 12-19, USB on 6+7.*
+
 Four differential pairs on GPIO12-19. libdvi's `pico_sock_cfg` is exactly this pinout, so
 `board.h` uses it unchanged and any Pico DVI breakout that follows it will work: an HSTX to DVI
 adapter, a Pico DVI Sock, a plain HDMI breakout, or soldered wires. On the RP2350 these are the
@@ -88,6 +92,10 @@ W: D0 GPIO12/13, CK 14/15, D2 16/17, D1 18/19.
 | `1080p30` | 1920×1080, CEA VIC 34, 33.8 kHz / 30.06 Hz | as 720p60 | clk_sys | 74.4 MHz | 1.30 V |
 | `1080p25` | 1920×1080, CEA VIC 33, 28.2 kHz / 25.05 Hz | as 720p60 | clk_sys | 74.4 MHz | 1.30 V |
 | `1080p24` | 1920×1080, CEA VIC 32, 27.1 kHz / 24.05 Hz | as 720p60 | clk_sys | 74.4 MHz | 1.30 V |
+
+![A Vizio information bar reading 1080p over the kiosk's output](images/kiosk-1080p.jpg)
+
+*The sink's own report of what it is being sent, in the 1080p30 mode below.*
 
 - **1080p.** DVI sends ten bits per pixel per lane whatever the colour depth, so the link rate is set
   by the pixel clock alone. 1080p60 needs 148.5 MHz, twice what HSTX manages, but 1080p at 24-30 Hz
