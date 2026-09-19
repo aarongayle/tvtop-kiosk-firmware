@@ -8,7 +8,7 @@ option(KIOSK_NO_RADIO "Diagnostic build: never start the Wi-Fi radio" OFF)
 # stack and TLS, and this firmware talks to it through src/pico/modem_link.c. Also buildable on a
 # Pico 2 W wired to an ESP32-C3 DevKit (docs/MODEM.md), which is how it is developed.
 option(KIOSK_MODEM "Use an ESP32 modem over UART instead of the on-board cyw43 radio" OFF)
-set(KIOSK_VIDEO_MODE "" CACHE STRING "Default video mode until one is stored. Pico W: 720p30 | 720p30rb | 480p60 | 720x480p60 | 960x540p60 | 1066x600p50 (default 720p30). Pico 2 W: 720p60 | 960x540p60 | 480p60 (default 720p60)")
+set(KIOSK_VIDEO_MODE "" CACHE STRING "Default video mode until one is stored. Pico W (RP2040): 720p30 | 720p30rb | 480p60 | 720x480p60 | 960x540p60 | 1066x600p50 (default 720p30). Pico 2 W (RP2350): 720p60 | 1080p30 | 1080p25 | 1080p24 | 960x540p60 | 480p60 (default 720p60)")
 set(KIOSK_SERVER_BASE "https://kiosk.tvtop.games" CACHE STRING "Default kiosk server base URL")
 # Whether a network really reaches the internet is decided by fetching this and expecting 204 with
 # no body; anything else means something is answering on the network's behalf (a sign-in portal).
