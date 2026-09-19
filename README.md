@@ -116,15 +116,15 @@ rejects the timing, or a long HDMI cable at 744 Mbit/s from 3.3 V pins.
 ## Pointing it somewhere else
 
 The kiosk talks to `https://kiosk.tvtop.games` by default. Override it at build time with
-`-DKIOSK_SERVER_BASE=`, on the setup page, or with `server <url>` on the serial console. The wire
-protocol is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the server itself is not
-open source.
+`-DKIOSK_SERVER_BASE=`, on the setup page, or with `server <url>` on the serial console. The drawing
+ops the kiosk implements are documented in [docs/RENDERING.md](docs/RENDERING.md). The protocol
+specification and the server itself are not open source.
 
 ## Docs
 
 | | |
 |---|---|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the pieces fit together, and the protocol |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the pieces fit together, and the constraints behind it |
 | [BUILD.md](docs/BUILD.md) | build options and flashing |
 | [HARDWARE.md](docs/HARDWARE.md) | wiring, video modes, the overclock, Wi-Fi interference |
 | [RENDERING.md](docs/RENDERING.md) | the drawing ops and how frames are rasterised |
