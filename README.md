@@ -5,6 +5,8 @@ Firmware that turns a Raspberry Pi Pico 2 W into an HDMI games console for
 everyone plays from their own phone. The kiosk joins your Wi-Fi, pairs with the TV-Top server, and
 draws whatever the current game sends it.
 
+![A television showing a Frontier Island reference screen, driven by the Pico on the stand below](docs/images/kiosk-on-tv.jpg)
+
 It outputs **1920x1080 at 30 Hz in full 8-bit-per-channel colour**, with no framebuffer and no
 external video hardware. A 1080p frame at 24 bit is almost 6 MB and the RP2350 has 520 KB, so there
 is no frame in memory at all. Each scanline is built as a run-length HSTX command stream just
@@ -16,22 +18,51 @@ tables, the overclock, and the Wi-Fi interference problem that comes with it.
 
 ## Build your own
 
-You do not need custom hardware. There are two ways to put one together, matching the two
-revisions of the custom board.
+You do not need custom hardware. A Raspberry Pi Pico 2 W, some way to get eight of its GPIOs onto
+an HDMI connector, and a TV.
 
-**Option 1: a Pico 2 W on its own.** The simplest build, two boards and a cable.
+There are two configurations, matching the two revisions of the custom board:
 
-| Part | Why |
-|---|---|
-| **Raspberry Pi Pico 2 W** | the RP2350 has the HSTX serialiser, and the on-board cyw43 does Wi-Fi |
-| **Adafruit PiCowBell HSTX DVI** (product 6363) | routes the TMDS pairs to an HDMI socket. A Pico DVI Sock works too, same pinout |
+| | Radio | Extra parts |
+|---|---|---|
+| **Option 1** | the Pico 2 W's on-board cyw43 | none |
+| **Option 2** | an ESP32 over a UART | an ESP32-C3 DevKitM-1 |
 
-**Option 2: a Pico 2 W plus an ESP32-C3 DevKitM-1.** Wi-Fi, the IP stack and TLS move onto the
-ESP32 over a UART, which is what the v3 board does and what the 1080p work is developed on. Wiring
-is in [docs/MODEM.md](docs/MODEM.md), and the ESP32 gets flashed separately with `idf.py`.
+Option 1 is the simpler build. Option 2 moves Wi-Fi, the IP stack and TLS onto the ESP32, which is
+what the v3 board does and what the 1080p work is developed on. Wiring and the ESP-IDF build are
+in [docs/MODEM.md](docs/MODEM.md).
 
-Either way, plug the PiCowBell onto the Pico 2 W, run an HDMI cable to the TV, and power it over
-USB. A Pico W (RP2040) also runs this firmware, but it tops out well below 1080p.
+![A Pico 2 W wired to an ESP32-C3 DevKitM-1, with an HDMI cable between them](docs/images/bring-up-rig.jpg)
+
+*Option 2 on the bench: a Pico 2 W and an ESP32-C3 DevKitM-1, with the HSTX DVI breakout between the Pico and the HDMI cable.*
+
+A Pico W (RP2040) also runs this firmware, driving DVI from PIO instead of HSTX, but it tops out
+well below 1080p.
+
+### Getting HDMI off the board
+
+Four differential pairs, eight GPIOs. The positive line of each pair is the lower GPIO, so nothing
+needs inverting:
+
+| Signal | + | − |
+|---|---|---|
+| D0, blue | GPIO12 | GPIO13 |
+| Clock | GPIO14 | GPIO15 |
+| D2, red | GPIO16 | GPIO17 |
+| D1, green | GPIO18 | GPIO19 |
+
+This is the same pinout as libdvi's `pico_sock_cfg`, which most Pico DVI breakouts follow, so any
+of them will work: an HSTX to DVI adapter, a Pico DVI Sock, a plain HDMI breakout board, or
+soldered wires. Pick whatever is in stock.
+
+Optionally, DDC on GPIO4 (SDA) and GPIO5 (SCL) lets the `edid` console command read what modes
+your display actually claims to support, which is the fastest way to work out why a TV is refusing
+a mode. Video works without it.
+
+**On wiring quality.** At 1080p each lane carries 744 Mbit/s out of 3.3 V CMOS pins. Jumper wires
+on a breadboard are fine for getting a picture at `480p60` and will probably manage `720p60`, but
+1080p wants short, tightly paired connections and a short HDMI cable. Start at `480p60`, confirm
+you have a picture, then work up.
 
 ## Quick start
 
@@ -91,15 +122,15 @@ rejects the timing, or a long HDMI cable at 744 Mbit/s from 3.3 V pins.
 ## Pointing it somewhere else
 
 The kiosk talks to `https://kiosk.tvtop.games` by default. Override it at build time with
-`-DKIOSK_SERVER_BASE=`, on the setup page, or with `server <url>` on the serial console. The wire
-protocol is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the server itself is not
-open source.
+`-DKIOSK_SERVER_BASE=`, on the setup page, or with `server <url>` on the serial console. The drawing
+ops the kiosk implements are documented in [docs/RENDERING.md](docs/RENDERING.md). The protocol
+specification and the server itself are not open source.
 
 ## Docs
 
 | | |
 |---|---|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the pieces fit together, and the protocol |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the pieces fit together, and the constraints behind it |
 | [BUILD.md](docs/BUILD.md) | build options and flashing |
 | [HARDWARE.md](docs/HARDWARE.md) | wiring, video modes, the overclock, Wi-Fi interference |
 | [RENDERING.md](docs/RENDERING.md) | the drawing ops and how frames are rasterised |
@@ -118,4 +149,12 @@ open source.
 
 ## License
 
-TODO: pick one. MIT is the obvious fit and is compatible with the vendored BSD-3 and MIT code.
+[MIT](LICENSE), which covers everything here except the vendored and generated pieces below. They
+keep their own terms, all of them permissive and compatible with it.
+
+| | |
+|---|---|
+| `vendor/libdvi` | BSD 3-Clause, Luke Wren |
+| `vendor/pico-examples` | BSD 3-Clause, Raspberry Pi (Trading) Ltd |
+| `vendor/stb` | MIT or public domain, Sean Barrett |
+| `tools/fonts/*.ttf` | Apache 2.0, Google. `src/common/font_blob.c` and `assets/fonts.bin` are generated from them (`tools/fonts/NOTICE`) |

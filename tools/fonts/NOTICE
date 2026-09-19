@@ -1,0 +1,12 @@
+Roboto Regular and Roboto Bold
+Copyright 2011 Google Inc. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+these files except in compliance with the License. A copy is in LICENSE beside
+this file, and at http://www.apache.org/licenses/LICENSE-2.0
+
+The fonts themselves declare this license in their name table.
+
+src/common/font_blob.c and assets/fonts.bin are generated from these files by
+tools/fontgen (see docs/FONTS.md) and are therefore derived works covered by the
+same license. Everything else in this repository is MIT; see LICENSE at the root.
