@@ -118,4 +118,12 @@ open source.
 
 ## License
 
-TODO: pick one. MIT is the obvious fit and is compatible with the vendored BSD-3 and MIT code.
+[MIT](LICENSE), which covers everything here except the vendored and generated pieces below. They
+keep their own terms, all of them permissive and compatible with it.
+
+| | |
+|---|---|
+| `vendor/libdvi` | BSD 3-Clause, Luke Wren |
+| `vendor/pico-examples` | BSD 3-Clause, Raspberry Pi (Trading) Ltd |
+| `vendor/stb` | MIT or public domain, Sean Barrett |
+| `tools/fonts/*.ttf` | Apache 2.0, Google. `src/common/font_blob.c` and `assets/fonts.bin` are generated from them (`tools/fonts/NOTICE`) |
