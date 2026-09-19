@@ -1,16 +1,35 @@
 # Building and flashing
 
-## Prerequisites (already installed on this Mac)
+## Prerequisites
 
-| Tool | Where |
+| Tool | Notes |
 |---|---|
-| pico-sdk 2.2.0 (with cyw43-driver, lwip, mbedtls, tinyusb submodules) | `~/.pico-sdk/sdk/2.2.0` |
-| Arm GNU Toolchain 15.3.rel1 (arm-none-eabi, with newlib) | `~/.pico-sdk/toolchain/arm-gnu-toolchain-15.3.rel1-darwin-arm64-arm-none-eabi` |
-| cmake, ninja, picotool | Homebrew |
-| resvg (only for the reference renders) | Homebrew |
+| pico-sdk 2.2.0 or later, with the cyw43-driver, lwip, mbedtls and tinyusb submodules | |
+| Arm GNU Toolchain (arm-none-eabi, with newlib) | 15.3.rel1 is what this is developed against |
+| cmake, ninja, picotool | |
+| ESP-IDF 5.x | only for the `KIOSK_MODEM` build, to build the ESP32 side |
+| resvg | only for regenerating the reference renders |
 
-`CMakeLists.txt` defaults `PICO_SDK_PATH` and `PICO_TOOLCHAIN_PATH` to those locations; export
-either environment variable to override.
+`CMakeLists.txt` falls back to `~/.pico-sdk/sdk/2.2.0` and a matching toolchain path if neither
+`PICO_SDK_PATH` nor `PICO_TOOLCHAIN_PATH` is set. Export either environment variable, or pass
+`-DPICO_SDK_PATH=`, to point it at your own install.
+
+## The two builds
+
+There are two hardware configurations, matching the two revisions of the custom board:
+
+| | Radio | Build | Board it mirrors |
+|---|---|---|---|
+| **Pico 2 W on its own** | the on-board cyw43 | `-DPICO_BOARD=pico2_w -DKIOSK_TLS=ON` | v2 |
+| **Pico 2 W + an ESP32-C3 DevKitM-1** | the ESP32, over a UART | `-DPICO_BOARD=pico2_w -DKIOSK_MODEM=ON` | v3 |
+
+The first is the simpler thing to build: two boards and an HDMI cable. The second moves Wi-Fi, the
+IP stack and TLS onto the ESP32, which is what the v3 board does, and is the configuration the
+1080p work is developed on. Wiring for it is in [MODEM.md](MODEM.md), and the ESP32 side has to be
+flashed separately with `idf.py`.
+
+With `KIOSK_MODEM=ON`, leave `KIOSK_TLS=OFF`: the modem terminates TLS, so mbedTLS is not built
+into this firmware at all.
 
 ## Firmware
 
@@ -23,9 +42,12 @@ Output: `build/tvtop_kiosk.uf2`. Options:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `PICO_BOARD` | `pico_w` | `pico_w` or `pico2_w` (the Pico 2 W build is untested) |
+| `PICO_BOARD` | `pico_w` | `pico_w` (RP2040, DVI from PIO) or `pico2_w` (RP2350, DVI from HSTX). `pico2_w` is the one that reaches 1080p. |
 | `KIOSK_TLS` | `OFF` | build mbedTLS so `https://` servers work (`build-tls/` is a second tree with it on) |
-| `KIOSK_VIDEO_MODE` | `720p30` | default mode until one is stored: `720p30`, `720p30rb`, `480p60`, `720x480p60`, `960x540p60`, `1066x600p50` |
+| `KIOSK_VIDEO_MODE` | per board | default mode until one is stored. RP2040: `720p30`, `720p30rb`, `480p60`, `720x480p60`, `960x540p60`, `1066x600p50` (default `720p30`). RP2350: `720p60`, `1080p30`, `1080p25`, `1080p24`, `960x540p60`, `480p60` (default `720p60`) |
+| `KIOSK_MODEM` | `OFF` | take Wi-Fi from an ESP32 over a UART instead of the on-board cyw43 ([MODEM.md](MODEM.md)) |
+| `KIOSK_NO_RADIO` | `OFF` | diagnostic build that never starts the radio |
+| `KIOSK_NET_CHECK_URL` | Google's `generate_204` | the plain-HTTP URL used to detect sign-in portals |
 | `KIOSK_SERVER_BASE` | `https://kiosk.tvtop.games` | default server (`server <url>` on the console overrides) |
 | `KIOSK_WIFI_SSID` / `KIOSK_WIFI_PASSWORD` | empty | compile-in credentials to skip provisioning on a bench unit |
 

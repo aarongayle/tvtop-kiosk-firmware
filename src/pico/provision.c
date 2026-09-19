@@ -1,10 +1,17 @@
-// Wi-Fi provisioning: the captive-portal HTTP server (lwIP raw TCP) and the USB serial console.
+// Wi-Fi provisioning: the captive-portal HTTP server and the USB serial console.
+//
+// There are three transports under the same portal, chosen at build time. On the cyw43 build it is
+// lwIP raw TCP in the radio's background context. On the ESP32 modem build the modem accepts the
+// connections and relays the bytes, so the portal still runs here, on the RP2350, in main context:
+// one implementation, one place that validates what the form submits, and no portal HTML on the
+// modem. The third is the host test's stubs.
 //
 // Contexts: lwIP callbacks run in the cyw43 background context (a low-priority IRQ on core 0,
 // holding the async-context lock); provision_poll/console_poll run in main context. Anything that
 // writes flash (config_save, ~50 ms with interrupts off) or starts a driver operation (a scan) is
 // therefore deferred from the callbacks to provision_poll through small flag/staging variables,
-// and main context reads the shared scan table under cyw43_arch_lwip_begin/end.
+// and main context reads the shared scan table under cyw43_arch_lwip_begin/end. The modem build
+// has no second context, so those brackets compile away to nothing.
 //
 // The request parser, the form decoder, the response builder and the console command interpreter
 // are plain C so host/tests/test_provision.c can compile this file with PROVISION_HOST_TEST and
@@ -13,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "provision.h"
@@ -37,13 +45,19 @@ static uint32_t free_heap(void) { return 12345; }
 #else
 #include "board.h"
 #include "scanout.h"
-#include "pico/cyw43_arch.h"
 #include "pico/stdio.h"
 #include "pico/time.h"
 #include "hardware/watchdog.h"
 #include "hardware/structs/watchdog.h"
+#if KIOSK_MODEM
+#include "modem_link.h"
+#include "modem_flash.h"
+#include "modem_io.h"
+#else
+#include "pico/cyw43_arch.h"
 #include "lwip/tcp.h"
 #include "lwip/pbuf.h"
+#endif
 #include <malloc.h>
 static uint32_t provision_now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
 // newlib's sbrk heap starts at __end__ and may grow to __StackLimit (memmap_default.ld).
@@ -52,6 +66,22 @@ static uint32_t free_heap(void) {
     struct mallinfo mi = mallinfo();
     return (uint32_t)(&__StackLimit - &__end__) - (uint32_t)mi.uordblks;
 }
+#endif
+
+#ifndef KIOSK_MODEM
+#define KIOSK_MODEM 0
+#endif
+
+// The handle a portal connection is identified by: an lwIP pcb on the cyw43 build, the modem's
+// small connection number on the modem build. Only the transport glue at the bottom touches it.
+#if KIOSK_MODEM || defined(PROVISION_HOST_TEST)
+typedef int16_t portal_sock_t;
+#define PORTAL_SOCK_NONE ((portal_sock_t)-1)
+#define PORTAL_SOCK_LIVE(s) ((s) >= 0)
+#else
+typedef struct tcp_pcb *portal_sock_t;
+#define PORTAL_SOCK_NONE NULL
+#define PORTAL_SOCK_LIVE(s) ((s) != NULL)
 #endif
 
 #define PORTAL_IP "192.168.4.1"
@@ -221,12 +251,15 @@ typedef struct {
 } net_entry_t;
 
 static bool active;
+static bool netcheck_watch;      // the console asked for a probe and wants the verdict printed
 static char ap_ssid[16];
 static net_entry_t nets[PORTAL_MAX_NETS];
 static uint8_t nets_n;
 static volatile bool scan_requested;     // set by GET /scan (callback), consumed by provision_poll
 static uint32_t scan_started_ms;
+static uint32_t scan_done_ms;
 static bool scan_ever;
+static bool scan_done_ever;
 
 // A portal POST is staged here by the lwIP callback and applied + saved by provision_poll.
 typedef struct {
@@ -264,10 +297,19 @@ static void nets_add(const uint8_t *ssid, size_t ssid_len, int16_t rssi, bool op
     nets[slot].open = open;
 }
 
+static void nets_sort(void) {
+    for (unsigned i = 1; i < nets_n; i++) {
+        net_entry_t key = nets[i];
+        unsigned j = i;
+        while (j > 0 && nets[j - 1].rssi < key.rssi) { nets[j] = nets[j - 1]; j--; }
+        nets[j] = key;
+    }
+}
+
 // ---- HTTP: connection state, request parsing, response building ----------------------------
 
 typedef struct {
-    struct tcp_pcb *pcb;
+    portal_sock_t sock;
     char buf[PORTAL_BUF];         // request; after handling, a dynamic response body
     uint16_t len;
     uint16_t head_len;            // 0 until "\r\n\r\n" has arrived
@@ -383,7 +425,7 @@ static void respond_config_json(conn_t *c) {
     size_t len = 0;
     char *b = c->buf;
     bool ok = json_append(b, sizeof c->buf, &len, "{\"ssid\":")
-        && json_append_str(b, sizeof c->buf, &len, kiosk_config.wifi_ssid, sizeof kiosk_config.wifi_ssid)
+        && json_append_str(b, sizeof c->buf, &len, kiosk_config.net_count ? kiosk_config.nets[0].ssid : "", sizeof kiosk_config.nets[0].ssid)
         && json_append(b, sizeof c->buf, &len, ",\"server\":")
         && json_append_str(b, sizeof c->buf, &len, kiosk_config.server_base, sizeof kiosk_config.server_base)
         && json_append(b, sizeof c->buf, &len, ",\"mode\":")
@@ -562,8 +604,16 @@ static void print_status(void) {
     printf("wifi: %s", wifi_state_name(ws));
     if (ws == WIFI_UP) printf(", ip %s, rssi %d dBm", net_wifi_ip(ip, sizeof ip), net_wifi_rssi());
     if (ws == WIFI_AP) printf(" %s at " PORTAL_IP, ap_ssid);
-    printf("\nssid: %s%s\nserver: %s\nmode: %s\nregistered: %s%s%s\nfw: %s\nheap free: %u bytes\nuptime: %u s\n",
-           kiosk_config.wifi_ssid, kiosk_config.wifi_ssid[0] ? "" : "(none - use `wifi <ssid> <password>`)",
+    printf("\n");
+    if (!kiosk_config.net_count) {
+        printf("networks: none - use `wifi <ssid> <password>`\n");
+    } else {
+        printf("networks: %u known, most recent first\n", kiosk_config.net_count);
+        for (unsigned i = 0; i < kiosk_config.net_count; i++)
+            printf("  %u. %s%s\n", i + 1, kiosk_config.nets[i].ssid,
+                   kiosk_config.nets[i].pass[0] ? "" : " (open)");
+    }
+    printf("server: %s\nmode: %s\nregistered: %s%s%s\nfw: %s\nheap free: %u bytes\nuptime: %u s\n",
            kiosk_config.server_base, video_mode_info((video_mode_t)kiosk_config.video_mode)->name,
            kiosk_config.token[0] ? "yes, id " : "no", kiosk_config.token[0] ? kiosk_config.device_id : "",
            kiosk_config.next_url[0] ? " (next_url cached)" : "",
@@ -579,7 +629,8 @@ static void print_help(void) {
            "  help                     this list\n"
            "  status                   loop state, wifi, config, heap\n"
            "  stats                    render/scanout counters\n"
-           "  wifi <ssid> [password]   join a network (quote an ssid with spaces; no password = open)\n"
+           "  wifi <ssid> [password]   remember a network and join it (quote an ssid with spaces; no password = open)\n"
+           "  forget <ssid> | all      drop a remembered network\n"
            "  server <url>             kiosk server base, e.g. server http://192.168.1.10:8080\n"
            "  mode <" KIOSK_MODE_NAMES ">   video mode (reboots)\n"
            "  scan                     list nearby networks\n"
@@ -594,6 +645,14 @@ static void print_help(void) {
            "  bench                    time the scanline expander\n"
            "  pads <2|4|8|12> [fast]   TMDS pad drive and slew\n"
            "  smps pwm|save            3V3 regulator mode\n"
+#ifndef PROVISION_HOST_TEST
+           "  portal                   start the provisioning AP and captive portal now\n"
+           "  netcheck                 probe whether this network really reaches the internet\n"
+#endif
+#if KIOSK_MODEM
+           "  modem reset|boot|flash|image   restart the modem, park it in its ROM bootloader,\n"
+           "                           write the stored firmware image to it, or report that image\n"
+#endif
            "  sigsweep                 cycle pad and regulator settings, 20 s each\n"
            "  tmds off|on              silence the DVI pins (Wi-Fi interference test); kept across resets\n"
            "  norender [off]           decode frames without drawing them; kept across resets\n"
@@ -632,6 +691,54 @@ static void console_exec(char *line) {
         printf("heap free: %u bytes, uptime %u s\n", (unsigned)free_heap(), (unsigned)(provision_now_ms() / 1000u));
 #ifndef PROVISION_HOST_TEST
         printf("wifi rssi: %d dBm, channel %d, tmds %s\n", net_wifi_rssi(), net_wifi_channel(), watchdog_hw->scratch[3] == 0x544d4f46u ? "off" : "on");
+#endif
+#if KIOSK_MODEM
+        {
+            const modem_link_stats_t *m = modem_link_stats();
+            printf("modem: %s fw %s | rx %lu frames %lu B (crc %lu, resync %lu, overrun %lu) | tx %lu frames %lu B (full %lu)\n",
+                   modem_link_ready() ? "up" : "DOWN", modem_link_fw(),
+                   (unsigned long)m->rx_frames, (unsigned long)m->rx_bytes, (unsigned long)m->rx_crc_errors,
+                   (unsigned long)m->rx_resyncs, (unsigned long)m->rx_overruns,
+                   (unsigned long)m->tx_frames, (unsigned long)m->tx_bytes, (unsigned long)m->tx_full);
+        }
+#endif
+#ifndef PROVISION_HOST_TEST
+    } else if (strcmp(cmd, "netcheck") == 0) {
+        // Asks the radio whether this network actually reaches the internet, rather than waiting
+        // for the kiosk to work it out from failing polls.
+        net_wifi_check_start();
+        netcheck_watch = true;
+        printf("netcheck: probing...\n");
+    } else if (strcmp(cmd, "portal") == 0) {
+        // Brings the provisioning AP and the captive portal up without wiping the stored
+        // credentials, which `factory` would. The station drops when the AP starts, so the loop
+        // parks itself in wifi-wait; saving the form reboots as usual, and so does `reboot` if you
+        // only wanted a look.
+        if (provision_active()) { printf("portal: already running as \"%s\"\n", provision_ap_ssid()); return; }
+        provision_start(false);
+#endif
+#if KIOSK_MODEM
+    } else if (strcmp(cmd, "modem") == 0) {
+        // `modem reset` restarts the modem firmware, `modem boot` parks it in its ROM bootloader
+        // for esptool over USB, and `modem flash` writes the stored image to it over the UART —
+        // which is how v3, with its single USB-C port, is programmed at all.
+        if (argc >= 2 && strcmp(argv[1], "flash") == 0) {
+            if (modem_flash_run()) kiosk_loop_restart();
+            return;
+        }
+        if (argc >= 2 && strcmp(argv[1], "image") == 0) {
+            uint32_t ulen = 0, clen = 0;
+            if (modem_flash_image_present(&ulen, &clen))
+                printf("modem image: %lu bytes, %lu compressed, at 0x%08x\n",
+                       (unsigned long)ulen, (unsigned long)clen, (unsigned)KIOSK_MODEM_IMAGE_OFFSET);
+            else
+                printf("modem image: none installed at 0x%08x\n", (unsigned)KIOSK_MODEM_IMAGE_OFFSET);
+            return;
+        }
+        bool boot = argc >= 2 && strcmp(argv[1], "boot") == 0;
+        printf("modem: %s\n", boot ? "resetting into the ROM bootloader" : "resetting");
+        modem_link_reset(boot);
+        if (!boot) kiosk_loop_restart();
 #endif
 #ifndef PROVISION_HOST_TEST
     } else if (strcmp(cmd, "bench") == 0) {
@@ -706,9 +813,20 @@ static void console_exec(char *line) {
         size_t pl = strlen(pass);
         if (pl > 64) { printf("error: password longer than 64 characters\n"); return; }
         if (pl != 0 && pl < 8) { printf("error: a WPA2 password has at least 8 characters\n"); return; }
-        copy_bounded(kiosk_config.wifi_ssid, sizeof kiosk_config.wifi_ssid, ssid, strlen(ssid));
-        copy_bounded(kiosk_config.wifi_pass, sizeof kiosk_config.wifi_pass, pass, pl);
+        if (!config_net_add(ssid, pass)) { printf("wifi: ssid too long\n"); return; }
         printf("wifi: joining \"%s\" (%s)\n", ssid, pl ? "WPA2" : "open");
+        apply_and_restart();
+    } else if (strcmp(cmd, "forget") == 0) {
+        if (argc < 2) { printf("usage: forget <ssid> | forget all\n"); return; }
+        if (strcmp(argv[1], "all") == 0) {
+            config_net_forget_all();
+            printf("forgot every network\n");
+        } else if (config_net_forget(argv[1])) {
+            printf("forgot \"%s\" (%u left)\n", argv[1], kiosk_config.net_count);
+        } else {
+            printf("no saved network called \"%s\"\n", argv[1]);
+            return;
+        }
         apply_and_restart();
     } else if (strcmp(cmd, "server") == 0) {
         if (argc < 2) { printf("usage: server <http://host[:port]>\n"); return; }
@@ -799,43 +917,199 @@ void console_poll(void) {
 }
 #endif
 
-// ---- Device-only: lwIP transport and the driver scan -----------------------------------------
+// ---- Transport glue and the driver scan -------------------------------------------------------
+//
+// Three variants of the same five hooks: portal_listen / portal_unlisten / portal_busy /
+// portal_tick and scan_start / scan_active. Everything above this line is shared.
 
-#ifndef PROVISION_HOST_TEST
+#ifdef PROVISION_HOST_TEST
+
+static bool portal_listen(void) { return true; }
+static void portal_unlisten(void) {}
+static bool portal_busy(void) { return false; }
+static void portal_tick(uint32_t now) { (void)now; }
+static void scan_start(void) { scan_started_ms = provision_now_ms(); scan_ever = true; host_scan_start_hook(); }
+static bool scan_active(void) { return false; }
+#define cyw43_arch_lwip_begin() ((void)0)
+#define cyw43_arch_lwip_end() ((void)0)
+
+#elif KIOSK_MODEM
+
+// The modem owns the AP, the DHCP and DNS servers and the listening socket; it hands us accepted
+// connections as small integers and shovels bytes both ways. Everything here runs in main context,
+// so the deferral machinery the lwIP variant needs is simply not exercised.
+#define cyw43_arch_lwip_begin() ((void)0)
+#define cyw43_arch_lwip_end() ((void)0)
+
+// Bytes allowed out per connection before the modem confirms it wrote them. The portal's largest
+// response is the page itself (a few KB), so one window covers most replies in a single pass while
+// still bounding what a stalled phone can tie up in the transmit ring.
+#define PORTAL_SOCK_WINDOW 2048u
+#define PORTAL_IDLE_MS 10000u
+
+static conn_t conns[PORTAL_MAX_CONN];
+static uint32_t conn_touched_ms[PORTAL_MAX_CONN];
+static bool scan_running;
+
+static conn_t *conn_find(uint8_t id) {
+    for (int i = 0; i < PORTAL_MAX_CONN; i++)
+        if (PORTAL_SOCK_LIVE(conns[i].sock) && (uint8_t)conns[i].sock == id) return &conns[i];
+    return NULL;
+}
+
+static void conn_release(conn_t *c) { c->sock = PORTAL_SOCK_NONE; }
+
+static void conn_shutdown(conn_t *c, bool abort) {
+    if (!PORTAL_SOCK_LIVE(c->sock)) return;
+    uint8_t m[2] = { (uint8_t)c->sock, abort };
+    modem_link_send(H_SOCK_CLOSE, m, 2);
+    conn_release(c);
+}
+static void conn_close(conn_t *c) { conn_shutdown(c, false); }
+static void conn_abort(conn_t *c) { conn_shutdown(c, true); }
+
+static void conn_pump(conn_t *c) {
+    if (!PORTAL_SOCK_LIVE(c->sock) || !c->responding) return;
+    uint32_t total = (uint32_t)c->hdr_len + c->body_total;
+    while (c->sent < total) {
+        uint32_t outstanding = c->sent - c->acked;
+        if (outstanding >= PORTAL_SOCK_WINDOW) break;
+        uint16_t room = modem_link_tx_room();
+        if (room <= 1) break;
+        room--;                                     // the connection byte shares the payload
+        const char *src;
+        uint32_t avail;
+        if (c->sent < c->hdr_len) { src = c->hdr + c->sent; avail = c->hdr_len - c->sent; }
+        else { src = c->body + (c->sent - c->hdr_len); avail = total - c->sent; }
+        uint32_t win = PORTAL_SOCK_WINDOW - outstanding;
+        if (avail > win) avail = win;
+        uint16_t n = avail < room ? (uint16_t)avail : room;
+        uint8_t id = (uint8_t)c->sock;
+        if (!modem_link_send2(H_SOCK_DATA, &id, 1, src, n)) break;
+        c->sent += n;
+    }
+}
+
+void portal_modem_on_message(uint8_t type, const uint8_t *p, uint16_t len) {
+    if (!len) return;
+    uint8_t id = p[0];
+    conn_t *c = conn_find(id);
+    switch (type) {
+    case M_SOCK_OPEN: {
+        if (c) return;                              // the modem reused a number we still hold
+        for (int i = 0; i < PORTAL_MAX_CONN; i++) {
+            if (PORTAL_SOCK_LIVE(conns[i].sock)) continue;
+            memset(&conns[i], 0, sizeof conns[i]);
+            conns[i].sock = (portal_sock_t)id;
+            conn_touched_ms[i] = provision_now_ms();
+            return;
+        }
+        uint8_t m[2] = { id, 1 };                   // no slot: tell the modem to drop it
+        modem_link_send(H_SOCK_CLOSE, m, 2);
+        return;
+    }
+    case M_SOCK_DATA: {
+        if (!c) return;
+        conn_touched_ms[c - conns] = provision_now_ms();
+        int res = conn_feed(c, p + 1, (size_t)(len - 1));
+        if (res == FEED_ABORT) conn_abort(c);
+        else if (res == FEED_RESPOND) conn_pump(c);
+        return;
+    }
+    case M_SOCK_SENT: {
+        if (!c || len < 3) return;
+        uint16_t n;
+        memcpy(&n, p + 1, 2);
+        c->acked += n;
+        conn_touched_ms[c - conns] = provision_now_ms();
+        if (c->acked >= (uint32_t)c->hdr_len + c->body_total) conn_close(c);
+        else conn_pump(c);
+        return;
+    }
+    case M_SOCK_CLOSE:
+        if (c) conn_release(c);                     // the modem has already dropped it
+        return;
+    default:
+        return;
+    }
+}
+
+void portal_modem_on_modem_restart(void) {
+    for (int i = 0; i < PORTAL_MAX_CONN; i++) conns[i].sock = PORTAL_SOCK_NONE;
+    scan_running = false;
+}
+
+void provision_scan_result(const uint8_t *ssid, uint16_t ssid_len, int16_t rssi, bool open) {
+    nets_add(ssid, ssid_len, rssi, open);
+}
+void provision_scan_done(void) { scan_running = false; }
+
+// The modem starts listening when the AP comes up, so there is nothing to bind here.
+static bool portal_listen(void) {
+    for (int i = 0; i < PORTAL_MAX_CONN; i++) conns[i].sock = PORTAL_SOCK_NONE;
+    return true;
+}
+static void portal_unlisten(void) {
+    for (int i = 0; i < PORTAL_MAX_CONN; i++) conn_abort(&conns[i]);
+}
+static bool portal_busy(void) {
+    for (int i = 0; i < PORTAL_MAX_CONN; i++)
+        if (PORTAL_SOCK_LIVE(conns[i].sock) && conns[i].responding) return true;
+    return false;
+}
+// lwIP dropped stale connections from its own poll callback; here the main loop does it, and also
+// retries a pump that stopped because the transmit ring was full.
+static void portal_tick(uint32_t now) {
+    for (int i = 0; i < PORTAL_MAX_CONN; i++) {
+        if (!PORTAL_SOCK_LIVE(conns[i].sock)) continue;
+        if ((uint32_t)(now - conn_touched_ms[i]) > PORTAL_IDLE_MS) { conn_abort(&conns[i]); continue; }
+        conn_pump(&conns[i]);
+    }
+}
+
+static void scan_start(void) {
+    if (!modem_link_send(H_SCAN, NULL, 0)) return;
+    scan_running = true;
+    scan_started_ms = provision_now_ms();
+    scan_ever = true;
+}
+static bool scan_active(void) { return scan_running; }
+
+#else   // cyw43 + lwIP
 
 static conn_t conns[PORTAL_MAX_CONN];
 static struct tcp_pcb *listen_pcb;
 
 static void conn_detach(conn_t *c) {
-    if (!c->pcb) return;
-    tcp_arg(c->pcb, NULL);
-    tcp_recv(c->pcb, NULL);
-    tcp_sent(c->pcb, NULL);
-    tcp_err(c->pcb, NULL);
-    tcp_poll(c->pcb, NULL, 0);
+    if (!PORTAL_SOCK_LIVE(c->sock)) return;
+    tcp_arg(c->sock, NULL);
+    tcp_recv(c->sock, NULL);
+    tcp_sent(c->sock, NULL);
+    tcp_err(c->sock, NULL);
+    tcp_poll(c->sock, NULL, 0);
 }
 
 static void conn_close(conn_t *c) {
-    struct tcp_pcb *pcb = c->pcb;
+    struct tcp_pcb *pcb = c->sock;
     conn_detach(c);
-    c->pcb = NULL;
+    c->sock = PORTAL_SOCK_NONE;
     if (pcb && tcp_close(pcb) != ERR_OK) tcp_abort(pcb);
 }
 
 // For use when the caller is about to return ERR_ABRT to lwIP.
 static void conn_abort(conn_t *c) {
-    struct tcp_pcb *pcb = c->pcb;
+    struct tcp_pcb *pcb = c->sock;
     conn_detach(c);
-    c->pcb = NULL;
+    c->sock = PORTAL_SOCK_NONE;
     if (pcb) tcp_abort(pcb);
 }
 
 static void conn_pump(conn_t *c) {
-    if (!c->pcb || !c->responding) return;
+    if (!PORTAL_SOCK_LIVE(c->sock) || !c->responding) return;
     uint32_t total = (uint32_t)c->hdr_len + c->body_total;
     bool wrote = false;
     while (c->sent < total) {
-        uint16_t room = tcp_sndbuf(c->pcb);
+        uint16_t room = tcp_sndbuf(c->sock);
         if (room == 0) break;
         const char *src;
         uint32_t avail;
@@ -845,11 +1119,11 @@ static void conn_pump(conn_t *c) {
         // COPY: the dynamic bodies live in the connection buffer, and lwIP would copy anyway
         // (LWIP_NETIF_TX_SINGLE_PBUF).
         u8_t flags = TCP_WRITE_FLAG_COPY | (c->sent + n < total ? TCP_WRITE_FLAG_MORE : 0);
-        if (tcp_write(c->pcb, src, n, flags) != ERR_OK) break;
+        if (tcp_write(c->sock, src, n, flags) != ERR_OK) break;
         c->sent += n;
         wrote = true;
     }
-    if (wrote) tcp_output(c->pcb);
+    if (wrote) tcp_output(c->sock);
 }
 
 static err_t on_sent(void *arg, struct tcp_pcb *pcb, u16_t len) {
@@ -906,7 +1180,7 @@ static err_t on_poll(void *arg, struct tcp_pcb *pcb) {
 static void on_err(void *arg, err_t err) {
     conn_t *c = arg;
     (void)err;
-    if (c) c->pcb = NULL;   // lwIP has already freed the pcb
+    if (c) c->sock = PORTAL_SOCK_NONE;   // lwIP has already freed the pcb
 }
 
 static err_t on_accept(void *arg, struct tcp_pcb *pcb, err_t err) {
@@ -914,10 +1188,10 @@ static err_t on_accept(void *arg, struct tcp_pcb *pcb, err_t err) {
     if (err != ERR_OK || !pcb) return ERR_VAL;
     conn_t *c = NULL;
     for (int i = 0; i < PORTAL_MAX_CONN; i++)
-        if (!conns[i].pcb) { c = &conns[i]; break; }
+        if (!PORTAL_SOCK_LIVE(conns[i].sock)) { c = &conns[i]; break; }
     if (!c) { tcp_abort(pcb); return ERR_ABRT; }
     memset(c, 0, sizeof *c);
-    c->pcb = pcb;
+    c->sock = pcb;
     tcp_arg(pcb, c);
     tcp_recv(pcb, on_recv);
     tcp_sent(pcb, on_sent);
@@ -945,7 +1219,7 @@ static void portal_unlisten(void) {
 
 static bool portal_busy(void) {
     for (int i = 0; i < PORTAL_MAX_CONN; i++)
-        if (conns[i].pcb && conns[i].responding) return true;
+        if (PORTAL_SOCK_LIVE(conns[i].sock) && conns[i].responding) return true;
     return false;
 }
 
@@ -966,23 +1240,15 @@ static void scan_start(void) {
 
 static bool scan_active(void) { return cyw43_wifi_scan_active(&cyw43_state); }
 
-#else   // PROVISION_HOST_TEST
-
-static bool portal_listen(void) { return true; }
-static void portal_unlisten(void) {}
-static bool portal_busy(void) { return false; }
-static void scan_start(void) { scan_started_ms = provision_now_ms(); scan_ever = true; host_scan_start_hook(); }
-static bool scan_active(void) { return false; }
-#define cyw43_arch_lwip_begin() ((void)0)
-#define cyw43_arch_lwip_end() ((void)0)
+static void portal_tick(uint32_t now) { (void)now; }   // lwIP drives its own idle timer (on_poll)
 
 #endif
 
 // ---- Public API -------------------------------------------------------------------------------
 
-void provision_start(void) {
+void provision_start(bool keep_station) {
     if (active) return;
-    const char *ssid = net_wifi_start_ap();
+    const char *ssid = net_wifi_start_ap(keep_station);
     copy_bounded(ap_ssid, sizeof ap_ssid, ssid, strlen(ssid));
     cyw43_arch_lwip_begin();
     bool ok = portal_listen();
@@ -990,8 +1256,11 @@ void provision_start(void) {
     if (!ok) printf("portal: listen failed\n");
     active = true;
     scan_requested = true;   // have results ready before the phone loads the page
-    kiosk_show_builtin(BUILTIN_PROVISION, ap_ssid, "http://" PORTAL_IP);
-    printf("provisioning: join Wi-Fi \"%s\" and open " PORTAL_URL ", or type `help` here\n", ap_ssid);
+    // With keep_station the kiosk is still hunting for a network it knows, and the caller owns the
+    // screen so it can say both things at once.
+    if (!keep_station) kiosk_show_builtin(BUILTIN_PROVISION, ap_ssid, "http://" PORTAL_IP);
+    printf("provisioning: join Wi-Fi \"%s\" and open " PORTAL_URL ", or type `help` here%s\n",
+           ap_ssid, keep_station ? " (still retrying your networks)" : "");
 }
 
 void provision_stop(void) {
@@ -1004,24 +1273,57 @@ void provision_stop(void) {
     ap_ssid[0] = 0;
 }
 
+uint8_t wifi_scan_count(void) { return nets_n; }
+
+bool wifi_scan_get(uint8_t index, wifi_sighting_t *out) {
+    if (index >= nets_n || !out) return false;
+    out->ssid = nets[index].ssid;
+    out->rssi = nets[index].rssi;
+    out->open = nets[index].open;
+    return true;
+}
+
+void wifi_scan_request(void) { scan_requested = true; }
+bool wifi_scan_running(void) { return scan_active(); }
+
+uint32_t wifi_scan_age_ms(void) {
+    if (!scan_done_ever) return UINT32_MAX;
+    return provision_now_ms() - scan_done_ms;
+}
+
 bool provision_active(void) { return active; }
+
+bool provision_busy(void) { return portal_busy(); }
 
 const char *provision_ap_ssid(void) { return ap_ssid; }
 
 void provision_poll(void) {
     uint32_t now = provision_now_ms();
+    portal_tick(now);
+
+#ifndef PROVISION_HOST_TEST
+    if (netcheck_watch) {
+        static const char *names[] = { "idle", "pending", "online",
+                                       "captive portal - this network wants a browser sign-in",
+                                       "no dns", "no route to the internet", "unsupported on this build" };
+        net_check_t v = net_wifi_check_result();
+        if (v != NET_CHECK_PENDING && v != NET_CHECK_IDLE) {
+            netcheck_watch = false;
+            printf("netcheck: %s\n", names[v < 7 ? v : 0]);
+        }
+    }
+#endif
 
     if (save_requested && !reboot_at_ms) {
         pending_save_t p;
         cyw43_arch_lwip_begin();
         p = pending;
         cyw43_arch_lwip_end();
-        copy_bounded(kiosk_config.wifi_ssid, sizeof kiosk_config.wifi_ssid, p.ssid, strlen(p.ssid));
-        copy_bounded(kiosk_config.wifi_pass, sizeof kiosk_config.wifi_pass, p.pass, strlen(p.pass));
+        config_net_add(p.ssid, p.pass);
         if (p.server[0]) set_server_base(p.server);
         if (p.mode[0]) kiosk_config.video_mode = (uint8_t)video_mode_from_name(p.mode);
         if (!config_save()) printf("warning: config verify failed\n");
-        printf("portal: saved wifi \"%s\", server %s\n", kiosk_config.wifi_ssid, kiosk_config.server_base);
+        printf("portal: saved wifi \"%s\" (%u known), server %s\n", p.ssid, kiosk_config.net_count, kiosk_config.server_base);
         // save_requested stays set so a second POST is refused; the reboot clears everything.
         reboot_at_ms = now + REBOOT_GRACE_MS;
         if (reboot_at_ms == 0) reboot_at_ms = 1;
@@ -1034,13 +1336,25 @@ void provision_poll(void) {
         return;
     }
 
-    if (!active) return;
+    // Scanning is no longer the portal's private business: the join manager needs to know which of
+    // the stored networks is actually in the room, and the screen shows what is nearby. So this
+    // runs whether or not the portal is up.
+    static bool scan_was_active;
+    bool running = scan_active();
+    if (scan_was_active && !running) {
+        nets_sort();
+        scan_done_ms = now;
+        scan_done_ever = true;
+    }
+    scan_was_active = running;
+
     if (scan_requested) {
-        bool run = !scan_active() && (!scan_ever || (uint32_t)(now - scan_started_ms) >= SCAN_MIN_INTERVAL_MS);
+        bool run = !running && (!scan_ever || (uint32_t)(now - scan_started_ms) >= SCAN_MIN_INTERVAL_MS);
         if (run) {
             scan_requested = false;
+            nets_n = 0;          // results are a snapshot of here and now, not a running tally
             scan_start();
-        } else if (scan_active()) {
+        } else if (running) {
             scan_requested = false;   // one is already running; its results land in the table
         }
     }

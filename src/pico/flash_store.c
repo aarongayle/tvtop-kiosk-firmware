@@ -95,8 +95,11 @@ void config_defaults(void) {
     kiosk_config.magic = CONFIG_MAGIC;
     kiosk_config.version = CONFIG_VERSION;
     kiosk_config.length = (uint16_t)sizeof(kiosk_config_t);
-    copy_str(kiosk_config.wifi_ssid, sizeof kiosk_config.wifi_ssid, KIOSK_DEFAULT_WIFI_SSID);
-    copy_str(kiosk_config.wifi_pass, sizeof kiosk_config.wifi_pass, KIOSK_DEFAULT_WIFI_PASSWORD);
+    if (KIOSK_DEFAULT_WIFI_SSID[0]) {
+        copy_str(kiosk_config.nets[0].ssid, sizeof kiosk_config.nets[0].ssid, KIOSK_DEFAULT_WIFI_SSID);
+        copy_str(kiosk_config.nets[0].pass, sizeof kiosk_config.nets[0].pass, KIOSK_DEFAULT_WIFI_PASSWORD);
+        kiosk_config.net_count = 1;
+    }
     copy_str(kiosk_config.server_base, sizeof kiosk_config.server_base, KIOSK_DEFAULT_SERVER_BASE);
     // A trailing slash would double up when paths are appended.
     size_t n = strlen(kiosk_config.server_base);
@@ -107,18 +110,73 @@ void config_defaults(void) {
 
 // Everything read back from flash is untrusted: a half-written sector or an older layout must
 // not turn into an unterminated string somewhere downstream.
+// The v1 sector layout, kept only so an existing kiosk can be upgraded without losing its pairing
+// or its network. Nothing else may use it.
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t length;
+    char wifi_ssid[33];
+    char wifi_pass[65];
+    char server_base[KIOSK_MAX_URL];
+    char token[27];
+    char device_id[7];
+    char next_url[KIOSK_MAX_URL];
+    char static_id[KIOSK_MAX_STATIC_ID];
+    uint8_t video_mode;
+    uint8_t flags;
+    uint8_t wifi_channel;
+    uint8_t reserved[61];
+    uint32_t crc32;
+} kiosk_config_v1_t;
+
 static bool config_validate(kiosk_config_t *c) {
     if (c->magic != CONFIG_MAGIC || c->version != CONFIG_VERSION) return false;
     if (c->length != sizeof(kiosk_config_t)) return false;
     if (c->crc32 != config_crc(c)) return false;
-    if (memchr(c->wifi_ssid, 0, sizeof c->wifi_ssid) == NULL) return false;
-    if (memchr(c->wifi_pass, 0, sizeof c->wifi_pass) == NULL) return false;
+    if (c->net_count > KIOSK_MAX_NETWORKS) return false;
+    for (unsigned i = 0; i < KIOSK_MAX_NETWORKS; i++) {
+        if (memchr(c->nets[i].ssid, 0, sizeof c->nets[i].ssid) == NULL) return false;
+        if (memchr(c->nets[i].pass, 0, sizeof c->nets[i].pass) == NULL) return false;
+    }
     if (memchr(c->server_base, 0, sizeof c->server_base) == NULL) return false;
     if (memchr(c->token, 0, sizeof c->token) == NULL) return false;
     if (memchr(c->device_id, 0, sizeof c->device_id) == NULL) return false;
     if (memchr(c->next_url, 0, sizeof c->next_url) == NULL) return false;
     if (memchr(c->static_id, 0, sizeof c->static_id) == NULL) return false;
     if (c->video_mode >= VIDEO_MODE_LIMIT) return false;
+    return true;
+}
+
+// A v1 sector carries one network. Everything else about the device — its token, the server it
+// talks to, the video mode, the cached next_url — survives, so upgrading firmware does not send a
+// working kiosk back to its pairing screen.
+static bool config_migrate_v1(void) {
+    kiosk_config_v1_t old;
+    memcpy(&old, CONFIG_FLASH_PTR(), sizeof old);
+    if (old.magic != CONFIG_MAGIC || old.version != 1 || old.length != sizeof old) return false;
+    // Same convention as config_crc: init 0, no final xor. Getting this wrong silently sends
+    // every upgraded kiosk back to its pairing screen, which is exactly what it did the first time.
+    if (old.crc32 != crc32_update(0, &old, offsetof(kiosk_config_v1_t, crc32))) return false;
+    if (memchr(old.wifi_ssid, 0, sizeof old.wifi_ssid) == NULL) return false;
+    if (memchr(old.wifi_pass, 0, sizeof old.wifi_pass) == NULL) return false;
+    if (memchr(old.server_base, 0, sizeof old.server_base) == NULL) return false;
+
+    config_defaults();
+    if (old.wifi_ssid[0]) {
+        copy_str(kiosk_config.nets[0].ssid, sizeof kiosk_config.nets[0].ssid, old.wifi_ssid);
+        copy_str(kiosk_config.nets[0].pass, sizeof kiosk_config.nets[0].pass, old.wifi_pass);
+        kiosk_config.net_count = 1;
+    }
+    copy_str(kiosk_config.server_base, sizeof kiosk_config.server_base, old.server_base);
+    memcpy(kiosk_config.token, old.token, sizeof kiosk_config.token);
+    memcpy(kiosk_config.device_id, old.device_id, sizeof kiosk_config.device_id);
+    copy_str(kiosk_config.next_url, sizeof kiosk_config.next_url, old.next_url);
+    copy_str(kiosk_config.static_id, sizeof kiosk_config.static_id, old.static_id);
+    kiosk_config.video_mode = old.video_mode < VIDEO_MODE_LIMIT ? old.video_mode : 0;
+    kiosk_config.flags = old.flags;
+    kiosk_config.wifi_channel = old.wifi_channel;
+    kiosk_config.crc32 = config_crc(&kiosk_config);
     return true;
 }
 
@@ -130,9 +188,62 @@ bool config_load(void) {
         dirty = false;
         return true;
     }
+    if (config_migrate_v1()) {
+        dirty = true;   // rewritten in the new layout by the next config_poll
+        return true;
+    }
     config_defaults();
     dirty = false;
     return false;
+}
+
+// --------------- The known-network list ---------------
+
+int config_net_find(const char *ssid) {
+    if (!ssid || !ssid[0]) return -1;
+    for (unsigned i = 0; i < kiosk_config.net_count; i++)
+        if (strcmp(kiosk_config.nets[i].ssid, ssid) == 0) return (int)i;
+    return -1;
+}
+
+void config_net_promote(int index) {
+    if (index <= 0 || index >= (int)kiosk_config.net_count) return;
+    kiosk_network_t moved = kiosk_config.nets[index];
+    memmove(&kiosk_config.nets[1], &kiosk_config.nets[0], (size_t)index * sizeof(kiosk_network_t));
+    kiosk_config.nets[0] = moved;
+}
+
+bool config_net_add(const char *ssid, const char *pass) {
+    if (!ssid || !ssid[0] || strlen(ssid) >= sizeof kiosk_config.nets[0].ssid) return false;
+    int at = config_net_find(ssid);
+    if (at >= 0) {
+        copy_str(kiosk_config.nets[at].pass, sizeof kiosk_config.nets[at].pass, pass ? pass : "");
+        config_net_promote(at);
+        return true;
+    }
+    // Full: the entry at the back is the one joined longest ago, so it is the one to lose.
+    unsigned n = kiosk_config.net_count < KIOSK_MAX_NETWORKS ? kiosk_config.net_count : KIOSK_MAX_NETWORKS - 1;
+    memmove(&kiosk_config.nets[1], &kiosk_config.nets[0], (size_t)n * sizeof(kiosk_network_t));
+    memset(&kiosk_config.nets[0], 0, sizeof kiosk_config.nets[0]);
+    copy_str(kiosk_config.nets[0].ssid, sizeof kiosk_config.nets[0].ssid, ssid);
+    copy_str(kiosk_config.nets[0].pass, sizeof kiosk_config.nets[0].pass, pass ? pass : "");
+    if (kiosk_config.net_count < KIOSK_MAX_NETWORKS) kiosk_config.net_count++;
+    return true;
+}
+
+bool config_net_forget(const char *ssid) {
+    int at = config_net_find(ssid);
+    if (at < 0) return false;
+    unsigned tail = kiosk_config.net_count - (unsigned)at - 1u;
+    if (tail) memmove(&kiosk_config.nets[at], &kiosk_config.nets[at + 1], tail * sizeof(kiosk_network_t));
+    kiosk_config.net_count--;
+    memset(&kiosk_config.nets[kiosk_config.net_count], 0, sizeof kiosk_config.nets[0]);
+    return true;
+}
+
+void config_net_forget_all(void) {
+    memset(kiosk_config.nets, 0, sizeof kiosk_config.nets);
+    kiosk_config.net_count = 0;
 }
 
 bool config_save(void) {

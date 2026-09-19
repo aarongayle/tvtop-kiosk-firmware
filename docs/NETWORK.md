@@ -52,6 +52,64 @@ saying so instead of failing silently. The Pico 2 W has the RAM for `KIOSK_TLS=O
 | mbedTLS | — | ~40 KB peak |
 | line pool (`KIOSK_LINEPOOL_BYTES`) | 84 KB | 56 KB |
 
+## Finding a network away from home
+
+A kiosk that travels is plugged into a strange TV in a strange room, and nothing is where it was.
+Three rules follow from that, and they are what `kiosk_loop.c`'s join manager implements.
+
+**It remembers several networks, not one.** Up to `KIOSK_MAX_NETWORKS` (8), most recently joined
+first, so the list is its own LRU and the eighth pushes out the one you have not seen for longest.
+Home, the office, a phone's hotspot, the last place it was plugged in. The config sector is
+versioned and a v1 sector is migrated in place, so upgrading does not cost a paired kiosk its
+token.
+
+**It picks by what is actually in the room.** Every few seconds it scans, and tries whichever
+remembered network has the strongest live signal rather than working down a list blindly — so a
+dead entry at the front costs nothing. A network it cannot see is still tried in rotation, because
+a hidden SSID never appears in a scan and a scan can miss one that is really there. Scans only run
+between attempts: a radio mid-join refuses them (`ESP_ERR_WIFI_STATE`), and a fruitless search is a
+continuous stream of attempts, so asking at the wrong moment would mean never scanning at all in
+the one case that needs it.
+
+**It always leaves a way in.** After 45 fruitless seconds the setup AP comes up *alongside* the
+search — the stored networks are never cleared, and if one reappears the kiosk simply joins and
+takes the AP down again. Before this, a device whose network was absent sat on "Connecting…" for
+ever, and the only route back was a laptop and a USB cable: for a device whose premise is "plug it
+into any TV", precisely backwards.
+
+The ESP modem runs AP and station together, so this costs nothing. The cyw43 build cannot (a join
+in flight keeps the radio hopping channels), so there the two alternate — 60 s of AP, 25 s of
+trying — and it never interrupts a phone that is mid-way through the portal.
+`net_wifi_ap_is_concurrent()` is the seam.
+
+The screen says which networks it is looking for and which it can see, so you learn "your network
+is not here" from across the room instead of after two AP hops.
+
+## Joined, but is anything out there?
+
+Associating is not the same as reaching the internet, and a hotel or airport network will do the
+first and not the second until someone clicks "I agree" in a browser. The kiosk has no browser, and
+the authorisation is tied to the device asking, so a phone cannot do it on its behalf.
+
+The kiosk's own polling cannot tell that apart from the server being down: those requests are
+HTTPS, and a portal cannot intercept TLS — all it can do is break the handshake. So after two
+consecutive failures with the link up, the modem probes a **plain HTTP** URL whose only correct
+answer is `204` with no body (`KIOSK_NET_CHECK_URL`, Google's `generate_204` by default). Anything
+else means something is answering on the network's behalf.
+
+| Verdict | What the kiosk does |
+|---|---|
+| online | The network is fine and the kiosk server is not. Says so on the console; the offline badge over the last frame already covers it on screen. |
+| captive portal | Says this network needs a browser sign-in and that a phone hotspot is the way round it — and raises the setup AP so you can switch without hunting for a laptop. |
+| no dns / no route | Says it joined but cannot reach anything, and raises the AP the same way. |
+
+`netcheck` on the console runs the probe on demand. The cyw43 build has no probe — there is no
+second processor to run one — and reports `unsupported`, falling back to the offline badge.
+
+**This is a real limit, not a bug to be fixed later.** Hotel Wi-Fi is not reachable for a device
+with no browser, by anyone. What the kiosk can do is say so in one screen instead of showing
+"connecting" for ever, and make switching to a hotspot a ten-second job.
+
 ## Provisioning services
 
 In setup mode the kiosk runs a DHCP server (192.168.4.x), a DNS server that answers every name
