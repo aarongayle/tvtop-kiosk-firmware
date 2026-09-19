@@ -1,10 +1,12 @@
 # Hardware notes
 
-## Wiring — Adafruit PiCowBell HSTX DVI (product 6363)
+## Wiring
 
-The PiCowBell plugs onto a Pico / Pico 2 and routes the TMDS pairs to the RP2350's HSTX pins.
-On an RP2040 those same GPIOs are driven by PIO (PicoDVI). libdvi's `pico_sock_cfg` is exactly
-this pinout, so `board.h` uses it unchanged.
+Four differential pairs on GPIO12-19. libdvi's `pico_sock_cfg` is exactly this pinout, so
+`board.h` uses it unchanged and any Pico DVI breakout that follows it will work: an HSTX to DVI
+adapter, a Pico DVI Sock, a plain HDMI breakout, or soldered wires. On the RP2350 these are the
+HSTX pins; on an RP2040 the same GPIOs are driven by PIO (PicoDVI). Development was done on an
+Adafruit PiCowBell HSTX DVI (product 6363), which is only what happened to be in stock.
 
 | Signal | GPIO | libdvi lane |
 |---|---|---|
@@ -74,7 +76,7 @@ signal is otherwise a normal 1280×720 DVI stream.
 
 ## Pico 2 W (RP2350): HSTX
 
-The PiCowBell's pins are the RP2350's HSTX pins (GPIO12-19), so on a Pico 2 W the DVI signal comes
+GPIO12-19 are the RP2350's HSTX pins, so on a Pico 2 W the DVI signal comes
 from HSTX, a hardware serialiser with a built-in TMDS encoder, instead of PIO. Pairs as on the Pico
 W: D0 GPIO12/13, CK 14/15, D2 16/17, D1 18/19.
 
@@ -133,8 +135,8 @@ Select with the USB console (`mode 720p30rb`, then reboot) or at build time
 
 ## No picture?
 
-1. Check what the display accepts: `tools/pin-test` reads its EDID over the PiCowBell's DDC
-   lines and prints every mode it lists. A mode missing from that list will show "no signal".
+1. Check what the display accepts: `tools/pin-test` reads its EDID over the DDC lines
+   (GPIO4 SDA, GPIO5 SCL) and prints every mode it lists. Needs those two wired; video does not. A mode missing from that list will show "no signal".
 2. Try `mode 480p60` or `mode 720x480p60`. If that shows the test pattern (`test` on the console) the TMDS path is
    fine and the TV rejected the 720p30 timing or the board could not reach 372 MHz.
 3. Try `mode 720p30rb`: a 14% lower overclock.
