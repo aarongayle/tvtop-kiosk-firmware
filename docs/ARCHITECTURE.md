@@ -1,10 +1,13 @@
 # TV-Top Kiosk firmware — architecture
 
-Target: Raspberry Pi Pico W (RP2040, 264 KB SRAM, 2 MB flash) first; Pico 2 W (RP2350) next.
-Output: DVI over the Adafruit PiCowBell HSTX DVI (product 6363) at **1280×720p30** (372 MHz TMDS bit
-clock, RP2040 overclocked to 372 MHz at 1.30 V). The protocol the device speaks is
-`tvtop-expo/docs/KIOSK_PROTOCOL.md` (v3); the reference renderer is
-`tvtop-expo/helpers/Kiosk/SceneCanvas.js`. The device must draw what that SVG renderer draws.
+Targets: Raspberry Pi Pico 2 W (RP2350, 520 KB SRAM), which reaches **1920×1080p30**, and
+Raspberry Pi Pico W (RP2040, 264 KB SRAM, 2 MB flash), which tops out at **1280×720p30**. Both
+overclock to 372 MHz at 1.30 V for a 372 or 744 Mbit/s TMDS bit clock. DVI comes out on GPIO12-19
+through any breakout following libdvi's `pico_sock_cfg` pinout (see [HARDWARE.md](HARDWARE.md)).
+
+The device speaks version 3 of the TV-Top kiosk protocol and must draw what the platform's own SVG
+renderer draws. Those live in the TV-Top app repository, which is not public; the ops the kiosk
+implements and how it interprets them are documented in [RENDERING.md](RENDERING.md).
 
 ## The three hard constraints and how each is met
 
