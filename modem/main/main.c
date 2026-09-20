@@ -46,7 +46,9 @@ static void on_message(uint8_t type, const uint8_t *p, uint16_t len) {
         if (sl > 32 || pl > 64) return;
         memcpy(ssid, p + 1, sl); ssid[sl] = 0;
         memcpy(pass, p + 2 + sl, pl); pass[pl] = 0;
-        portal_enable(false);
+        // The portal follows the AP, not the station: while the fallback AP is up the host goes on
+        // re-issuing this join, and closing the portal here left a phone that had found the AP
+        // with nothing answering on 192.168.4.1.
         net_connect(ssid, pass);
         return;
     }

@@ -176,15 +176,21 @@ void net_connect(const char *ssid, const char *pass) {
     have_creds = true;
     backoff_ms = BACKOFF_MIN_MS;
     if (retry_timer) xTimerStop(retry_timer, 0);
-    if (ap_on) net_ap_stop();
 
+    // The setup AP is not this function's business. A kiosk that is hunting for a network it knows
+    // keeps the AP up *while* it tries — that is the whole point of the fallback — and the host
+    // re-issues the join every twenty seconds, so tearing the AP down here took it off the air
+    // within twenty seconds of the television telling someone to join it. The AP is raised and
+    // dropped by H_AP_START / H_AP_STOP alone, and a host that reboots resets this chip, so
+    // nothing can be left up by mistake.
+    //
     // esp_wifi's fields are fixed-size and need no terminator: a 32-character SSID fills ssid[]
     // exactly, which is why this is a memcpy and not an snprintf.
     wifi_config_t wc = {0};
     memcpy(wc.sta.ssid, want_ssid, strnlen(want_ssid, sizeof wc.sta.ssid));
     memcpy(wc.sta.password, want_pass, strnlen(want_pass, sizeof wc.sta.password));
     wc.sta.threshold.authmode = want_pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(ap_on ? WIFI_MODE_APSTA : WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_LOGI(TAG, "joining \"%s\"", want_ssid);
     set_state(MODEM_WIFI_CONNECTING);

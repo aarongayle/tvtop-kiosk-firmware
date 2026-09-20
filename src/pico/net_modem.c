@@ -140,7 +140,10 @@ void net_wifi_connect(const char *ssid, const char *password) {
     snprintf(sta_ssid, sizeof sta_ssid, "%s", ssid);
     snprintf(sta_pass, sizeof sta_pass, "%s", password ? password : "");
     want_sta = true;
-    want_ap = false;
+    // Not want_ap: this radio runs both at once, and the join manager re-issues the join every
+    // twenty seconds while the fallback AP is up. Forgetting the AP here meant a modem restart
+    // came back without it, while the kiosk went on telling the room to join it. Only
+    // net_wifi_stop_ap takes it down.
     state = WIFI_CONNECTING;
     check_result = NET_CHECK_IDLE;   // a different network deserves a fresh answer
     send_connect();
