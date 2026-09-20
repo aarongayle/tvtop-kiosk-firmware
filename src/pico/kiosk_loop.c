@@ -413,6 +413,10 @@ static const http_sink_t frame_sink = { frame_on_status, NULL, frame_on_body, fr
 #define JOIN_ATTEMPT_MS    20000u   // one network gets this long before the next is tried
 #define JOIN_FALLBACK_MS   45000u   // fruitless for this long: raise the setup AP as well
 #define JOIN_SCAN_EVERY_MS 12000u
+// While the setup AP is up, a scan competes with the one thing a person in the room is trying to
+// do. The portal asks for its own scan when the page is loaded, which is when a fresh list
+// actually matters.
+#define JOIN_SCAN_AP_MS    45000u
 // cyw43 only (see net_wifi_ap_is_concurrent): that radio cannot hold the AP up and keep joining,
 // so the two take turns. Long enough for someone to finish with the portal, short enough that a
 // network coming back is noticed within a minute.
@@ -426,7 +430,11 @@ static bool fallback_ap;                // the setup AP is up alongside the sear
 static uint32_t window_started_ms;      // cyw43 alternation
 static bool window_is_ap;
 static uint32_t last_scan_ms;
-static char screen_sig[192];            // redraw only when the words would change
+// Redraw only when the words would change. A checksum rather than a copy of the text: the lists
+// differ at their tails as often as anywhere else, so a prefix comparison missed changes that a
+// buffer big enough to hold the whole screen would have caught, and this board has no RAM to
+// spare for one. 0 means "nothing drawn yet".
+static uint32_t screen_sig;
 
 // The remembered network with the strongest live signal. -1 when the scan saw none of them (or
 // has not run yet, in which case the caller falls back to the most recently used).
@@ -443,12 +451,17 @@ static int best_known_in_range(void) {
     return best;
 }
 
-// "Gayle · Home · Pixel" — bounded, and honest about what it left out.
+// "Gayle · Home · Pixel" — bounded, and honest about what it left out. A busy room can hold a
+// dozen networks and naming them all would fill the screen with a list nobody reads, so the
+// strongest few stand for the rest.
+#define JOIN_LIST_MAX 6
+
 static void join_list(char *out, size_t cap, bool saved) {
     size_t n = 0;
     out[0] = 0;
     unsigned count = saved ? kiosk_config.net_count : wifi_scan_count();
     for (unsigned i = 0; i < count; i++) {
+        if (i == JOIN_LIST_MAX) { if (cap - n > 8) snprintf(out + n, cap - n, " · …"); return; }
         const char *ssid;
         if (saved) {
             ssid = kiosk_config.nets[i].ssid;
@@ -482,9 +495,9 @@ static void join_draw(void) {
 
     // Redraw only on a change: this runs every poll, and re-rendering 1080p for the same words
     // would eat the frame budget for nothing.
-    if (strncmp(screen_sig, body, sizeof screen_sig) == 0) return;
-    strncpy(screen_sig, body, sizeof screen_sig - 1);
-    screen_sig[sizeof screen_sig - 1] = 0;
+    uint32_t sig = crc32_update(0xFFFFFFFFu, body, strlen(body));
+    if (sig == screen_sig) return;
+    screen_sig = sig;
     kiosk_show_builtin(BUILTIN_WIFI_SETUP, fallback_ap ? provision_ap_ssid() : "", body);
 }
 
@@ -495,7 +508,7 @@ static void join_reset(void) {
     last_scan_ms = 0;
     window_started_ms = join_started_ms;
     window_is_ap = false;
-    screen_sig[0] = 0;
+    screen_sig = 0;
 }
 
 static void join_begin_attempt(int index) {
@@ -519,7 +532,7 @@ static void join_succeeded(void) {
         provision_stop();
         fallback_ap = false;
     }
-    screen_sig[0] = 0;
+    screen_sig = 0;
 }
 
 // The search, one step per main-loop pass. Returns true once the station is up.
@@ -527,16 +540,6 @@ static bool join_poll(void) {
     uint32_t now = now_ms();
     if (net_wifi_state() == WIFI_UP) { join_succeeded(); return true; }
     if (kiosk_config.net_count == 0) { join_draw(); return false; }
-
-    // Scan on a timer so the picture of the room stays current while the kiosk hunts — but only
-    // between attempts. A radio that is mid-join refuses to scan (esp_wifi returns
-    // ESP_ERR_WIFI_STATE), and since a fruitless search is a continuous stream of attempts, asking
-    // at the wrong moment would mean never scanning at all in the one case that needs it.
-    bool sta_idle = net_wifi_state() != WIFI_CONNECTING;
-    if (sta_idle && !wifi_scan_running() && (last_scan_ms == 0 || now - last_scan_ms >= JOIN_SCAN_EVERY_MS)) {
-        last_scan_ms = now;
-        wifi_scan_request();
-    }
 
     bool sta_allowed = true;
     if (fallback_ap && !net_wifi_ap_is_concurrent()) {
@@ -549,6 +552,22 @@ static bool join_poll(void) {
             else { provision_stop(); attempt_index = -1; }
         }
         sta_allowed = !window_is_ap;
+    }
+
+    // Scan on a timer so the picture of the room stays current while the kiosk hunts — but only
+    // between attempts, and only while the station side has the radio. A radio that is mid-join
+    // refuses to scan (esp_wifi returns ESP_ERR_WIFI_STATE), and since a fruitless search is a
+    // continuous stream of attempts, asking at the wrong moment would mean never scanning at all
+    // in the one case that needs it. A scan visits every channel, so on a single-radio build it
+    // takes the setup AP off the air for as long as it runs: someone would be hunting for
+    // TVTOP-xxxx in their phone's list during the seconds it stops beaconing. While that AP is up
+    // the nearby list is worth less than the AP being findable, so it goes slowly and never
+    // during the AP's own turn.
+    uint32_t scan_every = fallback_ap ? JOIN_SCAN_AP_MS : JOIN_SCAN_EVERY_MS;
+    bool sta_idle = net_wifi_state() != WIFI_CONNECTING;
+    if (sta_allowed && sta_idle && !wifi_scan_running() && (last_scan_ms == 0 || now - last_scan_ms >= scan_every)) {
+        last_scan_ms = now;
+        wifi_scan_request();
     }
 
     if (sta_allowed) {
@@ -575,7 +594,7 @@ static bool join_poll(void) {
         window_started_ms = now;
         printf("wifi: no luck after %u s; bringing up the setup AP as well\n", (unsigned)(JOIN_FALLBACK_MS / 1000u));
         provision_start(true);
-        screen_sig[0] = 0;
+        screen_sig = 0;
     }
 
     join_draw();
