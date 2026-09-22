@@ -25,6 +25,9 @@ implements and how it interprets them are documented in [RENDERING.md](RENDERING
    ~35k source vertices for Europe) is decoded *while it streams in* into a **flash-resident
    geometry cache** (`geom` store, flash region after the firmware). The renderer reads polygon
    vertices straight from XIP flash. Only the dynamic frame (≤16 KB JSON) becomes RAM structures.
+   A definition can be drawn where it was defined or placed at another position and scale, which
+   the rasteriser applies to each vertex as it reads it ([RENDERING.md](RENDERING.md)), so shared
+   shapes such as emoji are stored once.
 
 ## Pipeline
 

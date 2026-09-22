@@ -11,7 +11,12 @@
 #include <stdint.h>
 #include "kiosk_config.h"
 
-enum { GEOM_POLY = 1, GEOM_CIRCLE = 2 };
+enum { GEOM_POLY = 1, GEOM_CIRCLE = 2, GEOM_GROUP = 3 };
+// GROUP records: `count` uint16 pairs {member def id, paint index}, drawn in order. Members are
+// resolved when drawn (they may be stored before or after the group), and a member that is absent,
+// is itself a group, or names a paint the frame lacks is skipped. The bbox of a group record is
+// unused (all zero): the renderer takes the union of its members'.
+#define GEOM_GROUP_MAX 32
 // Vertex streams (POLY records): int16 px8 pairs. A marker pair {GEOM_BREAK, 0} precedes the first
 // vertex of every contour, the first contour included, so a stored stream always begins with a
 // marker; readers must tolerate a stream that starts without one (treat the first vertex as a
@@ -25,7 +30,7 @@ typedef struct {
     uint8_t kind;
     uint8_t flags;
     int16_t bx0, by0, bx1, by1;   // bounding box, whole pixels, [bx0,bx1) × [by0,by1)
-    uint32_t count;               // POLY: number of int16 pairs PRECEDING this header (incl. GEOM_BREAK markers); CIRCLE: 3
+    uint32_t count;               // POLY: number of int16 pairs PRECEDING this header (incl. GEOM_BREAK markers); CIRCLE: 3; GROUP: members
 } geom_rec_t;                      // a trailer: the data (int16 pairs px8 / int32 cx8, cy8, r8, 4-byte aligned) comes first,
                                    // so a record of any size can stream into the store before its size is known
 
@@ -46,6 +51,7 @@ const char *geom_store_id(const geom_store_t *g);
 const geom_rec_t *geom_store_get(const geom_store_t *g, uint16_t id);   // NULL if absent
 static inline const int16_t *geom_rec_verts(const geom_rec_t *r) { return (const int16_t *)((const uint8_t *)r - (size_t)r->count * 4); }
 static inline const int32_t *geom_rec_circle(const geom_rec_t *r) { return (const int32_t *)((const uint8_t *)r - 12); }
+static inline const uint16_t *geom_rec_members(const geom_rec_t *r) { return (const uint16_t *)((const uint8_t *)r - (size_t)r->count * 4); }
 uint16_t geom_store_count(const geom_store_t *g);
 
 // ---- writing ----  (scratch must be at least GEOM_SCRATCH_MIN bytes and stays owned until commit/abort:
@@ -57,6 +63,8 @@ uint16_t geom_store_count(const geom_store_t *g);
 bool geom_store_begin(geom_store_t *g, const char *static_id, uint8_t *scratch, size_t scratch_len);
 void geom_store_set_id(geom_store_t *g, const char *static_id);
 bool geom_store_add_circle(geom_store_t *g, uint16_t id, int32_t cx8, int32_t cy8, int32_t r8);
+// `members` is n {id, paint} pairs; n is at most GEOM_GROUP_MAX.
+bool geom_store_add_group(geom_store_t *g, uint16_t id, const uint16_t *members, uint32_t n);
 bool geom_store_begin_poly(geom_store_t *g, uint16_t id);
 bool geom_store_add_vertex(geom_store_t *g, int32_t x8, int32_t y8, bool contour_start);   // clamps to ±PX8_MAX
 bool geom_store_end_poly(geom_store_t *g);        // false if the record did not fit (record dropped, store still usable)

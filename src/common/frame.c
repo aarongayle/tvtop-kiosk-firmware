@@ -26,7 +26,7 @@
 
 enum { SEC_TOP = 0, SEC_OPS, SEC_STATIC, SEC_DEFS, SEC_PAINTS };
 enum { ET_NONE = 0, ET_NUM, ET_STR, ET_NULL, ET_BAD };
-enum { DEF_NONE = 0, DEF_PATH, DEF_POLY, DEF_CIRCLE, DEF_UNKNOWN };
+enum { DEF_NONE = 0, DEF_PATH, DEF_POLY, DEF_CIRCLE, DEF_GROUP, DEF_UNKNOWN };
 
 typedef struct { char s[SMALL_CAP]; uint8_t len; bool over; int8_t idx; } small_t;
 
@@ -58,6 +58,10 @@ typedef struct {
     uint16_t def_id;
     float def_f[4]; bool def_has[4];
     path_recorder_t rec;
+    // group defs: members are staged in the recorder scratch as {id, paint} uint16 pairs
+    bool grp_list, grp_member, grp_mbad;
+    uint8_t grp_n;
+    int32_t grp_paint;
     bool paint_active;
 } priv_t;
 
@@ -412,6 +416,17 @@ static void op_end(frame_decoder_t *d, priv_t *p) {
             int32_t paint = op_int(p, 2, -1);
             ok = def >= 0 && paint >= 0 && paint < KIOSK_MAX_PAINTS;
             if (ok) { op.v[0] = (int16_t)def; op.v[1] = (int16_t)paint; }
+            // Placed form ["u", id, paint, x, y, s]: only when all three are numbers, otherwise
+            // the extra elements are ignored and it is drawn where it was defined.
+            if (ok && op_num(p, 3, &a) && op_num(p, 4, &b) && op_num(p, 5, &c)) {
+                int32_t sc = px8_to_int(c);
+                ok = sc > 0 && sc <= RASTER_XF_S_MAX;
+                if (ok) {
+                    op.aux = 1;
+                    op.v[2] = (int16_t)scale_px8(&s, a, s.ox8); op.v[3] = (int16_t)scale_px8(&s, b, s.oy8);
+                    op.v[4] = (int16_t)sc;
+                }
+            }
             break;
         }
         default:
@@ -446,6 +461,7 @@ static void defs_begin(frame_decoder_t *d, priv_t *p) {
 static void def_begin(frame_decoder_t *d, priv_t *p) {
     p->def_active = true; p->def_bad = false;
     p->def_kind = DEF_NONE;
+    p->grp_list = false; p->grp_member = false; p->grp_n = 0;
     small_reset(&p->kind, 0);
     memset(p->def_has, 0, sizeof p->def_has);
     if (p->geom_ok) path_recorder_init(&p->rec, d->scratch, KIOSK_DECODE_RECORDER_BYTES);
@@ -460,7 +476,7 @@ static void def_element(frame_decoder_t *d, priv_t *p, const json_stream_t *js, 
             small_append(&p->kind, data, len);
             if (final) {
                 p->def_kind = small_eq(&p->kind, "path") ? DEF_PATH : small_eq(&p->kind, "poly") ? DEF_POLY
-                            : small_eq(&p->kind, "circle") ? DEF_CIRCLE : DEF_UNKNOWN;
+                            : small_eq(&p->kind, "circle") ? DEF_CIRCLE : small_eq(&p->kind, "group") ? DEF_GROUP : DEF_UNKNOWN;
             }
         } else if (idx == 1 && p->geom_ok) {
             if (p->def_kind == DEF_PATH) { if (!path_recorder_feed(&p->rec, data, len)) p->def_bad = true; }
@@ -478,10 +494,40 @@ static void def_element(frame_decoder_t *d, priv_t *p, const json_stream_t *js, 
     }
     case JSON_EV_NULL: case JSON_EV_TRUE: case JSON_EV_FALSE:
         return;
+    case JSON_EV_ARR_START:
+        if (idx == 1 && p->def_kind == DEF_GROUP && p->grp_n == 0 && !p->grp_list) { p->grp_list = true; return; }
+        p->def_bad = true;
+        return;
     default:
         p->def_bad = true;
         return;
     }
+}
+
+// Group members: ["group", [[id, paint], ...]]. A member that does not parse is skipped, not the
+// group; members past GEOM_GROUP_MAX are dropped.
+static void member_begin(priv_t *p) {
+    p->grp_member = true; p->grp_mbad = false; p->grp_paint = -1;
+    small_reset(&p->sa, 0);
+}
+
+static void member_element(priv_t *p, const json_stream_t *js, json_event_t ev, const char *data, size_t len) {
+    int idx = js->index[5];
+    if (!p->grp_member) return;
+    if (idx == 0 && (ev == JSON_EV_STRING || ev == JSON_EV_NUMBER)) small_append(&p->sa, data, len);   // a bare number is read as the id's digits
+    else if (idx == 1 && ev == JSON_EV_NUMBER) { int32_t v; if (json_number_to_int(data, len, &v)) p->grp_paint = v; }
+    else if (idx <= 1) p->grp_mbad = true;
+}
+
+static void member_end(frame_decoder_t *d, priv_t *p) {
+    if (!p->grp_member) return;
+    p->grp_member = false;
+    int id = p->sa.over ? -1 : parse_base36(p->sa.s, p->sa.len);
+    if (p->grp_mbad || id < 0 || p->grp_paint < 0 || p->grp_paint >= KIOSK_MAX_PAINTS) return;
+    if (!p->geom_ok || p->grp_n >= GEOM_GROUP_MAX) return;
+    uint16_t m[2] = { (uint16_t)id, (uint16_t)p->grp_paint };
+    memcpy(d->scratch + (size_t)p->grp_n * 4, m, 4);
+    p->grp_n++;
 }
 
 typedef struct { geom_store_t *g; bool ok; } vert_ctx_t;
@@ -506,6 +552,9 @@ static void def_end(frame_decoder_t *d, priv_t *p) {
             int32_t r8 = scale_px8(&s, float_to_px8(p->def_f[2]), 0);
             ok = r8 >= 0 && geom_store_add_circle(d->geom, p->def_id, cx8, cy8, r8);
         }
+    } else if (ok && p->def_kind == DEF_GROUP) {
+        _Static_assert(GEOM_GROUP_MAX * 4 <= KIOSK_DECODE_RECORDER_BYTES, "group members are staged in the recorder area");
+        ok = geom_store_add_group(d->geom, p->def_id, (const uint16_t *)(const void *)d->scratch, p->grp_n);
     } else if (ok && (p->def_kind == DEF_PATH || p->def_kind == DEF_POLY)) {
         ok = path_recorder_finish(&p->rec);   // false: overflow or syntax error → def dropped
         if (ok) {
@@ -639,6 +688,7 @@ static void top_scalar(frame_decoder_t *d, priv_t *p, const json_stream_t *js, j
                 scale_t s;
                 scale_setup(d->out_w, d->out_h, p->canvas_w ? p->canvas_w : CANVAS_W, p->canvas_h ? p->canvas_h : CANVAS_H, &s);
                 d->k_fx = s.k_fx; d->ox8 = s.ox8; d->oy8 = s.oy8;
+                f->ox8 = s.ox8; f->oy8 = s.oy8;
             }
         }
     }
@@ -707,11 +757,24 @@ static bool on_event(void *ctx, const json_stream_t *js, json_event_t ev, const 
         return true;
     case 4:
         if (p->sec == SEC_DEFS && p->def_active) {
+            if (ev == JSON_EV_ARR_END && p->grp_list) { p->grp_list = false; return true; }
             if (ev == JSON_EV_ARR_END || ev == JSON_EV_OBJ_END) return true;
             def_element(d, p, js, ev, data, len, final);
         } else if (p->sec == SEC_PAINTS && p->paint_active) {
             if (ev == JSON_EV_ARR_END || ev == JSON_EV_OBJ_END) return true;
             paint_element(p, js, ev, data, len);
+        }
+        return true;
+    case 5:
+        if (p->sec == SEC_DEFS && p->def_active && p->grp_list) {
+            if (ev == JSON_EV_ARR_START) member_begin(p);
+            else if (ev == JSON_EV_ARR_END) member_end(d, p);
+        }
+        return true;   // a member that is not an array is skipped
+    case 6:
+        if (p->sec == SEC_DEFS && p->def_active && p->grp_member) {
+            if (ev == JSON_EV_ARR_START || ev == JSON_EV_OBJ_START) p->grp_mbad = true;
+            else if (ev != JSON_EV_ARR_END && ev != JSON_EV_OBJ_END) member_element(p, js, ev, data, len);
         }
         return true;
     default:
@@ -733,6 +796,7 @@ void frame_decoder_init(frame_decoder_t *d, frame_t *frame, palette_t *pal, geom
     // The op table and arena are not cleared: nops/arena_len are the only truth about them.
     frame->version = 0;
     frame->w = out_w; frame->h = out_h;
+    frame->ox8 = s.ox8; frame->oy8 = s.oy8;
     frame->nops = 0; frame->arena_len = 0; frame->npaints = 0;
     frame->static_id[0] = 0; frame->next_url[0] = 0; frame->next_url_truncated = false;
     frame->next_ms = 0; frame->rev_lo = 0;
@@ -823,6 +887,50 @@ static const uint8_t *arena_str(const frame_t *f, uint16_t off, size_t *len) {
 static inline int32_t px_floor(int32_t v8) { return v8 >> PX8_SHIFT; }
 static inline int32_t px_ceil(int32_t v8) { return (v8 + PX8_ONE - 1) >> PX8_SHIFT; }
 
+// Draws one POLY or CIRCLE record with a paint: where it was defined, or placed through `xf`.
+// A placement whose box leaves the ±PX8_MAX range of stored geometry is not drawn (see
+// docs/RENDERING.md): clamping its vertices would bend edges that can still be on screen.
+static bool draw_geom(raster_t *r, const geom_rec_t *rec, const paint_t *pt, const raster_xf_t *xf) {
+    bool fill = pt->fill_alpha != 0, stroke = pt->stroke_alpha != 0 && pt->width8 > 0;
+    if (!fill && !stroke) return false;
+    int32_t w8 = pt->width8;
+    if (xf && stroke) { w8 = raster_xf_len(xf, w8); if (w8 < 1) w8 = 1; }
+    int32_t pad = stroke ? (w8 + PX8_ONE - 1) / PX8_ONE / 2 + 1 : 0;
+    if (rec->kind == GEOM_POLY) {
+        const int16_t *v = geom_rec_verts(rec);
+        if (rec->count < 2) return false;
+        if (!xf) {
+            if (!raster_band_intersects(r, rec->bx0 - pad, rec->by0 - pad, rec->bx1 + pad, rec->by1 + pad)) return false;
+            if (fill) raster_fill_poly(r, v, rec->count, FILL_NONZERO, pt->fill_idx, pt->fill_alpha);
+            if (stroke) raster_stroke_poly(r, v, rec->count, pt->width8, true, false, pt->stroke_idx, pt->stroke_alpha);
+            return true;
+        }
+        // The mapping is monotonic in x and in y, so the box maps onto the box of the mapped vertices.
+        int32_t x0 = raster_xf_x(xf, rec->bx0 * PX8_ONE), x1 = raster_xf_x(xf, rec->bx1 * PX8_ONE);
+        int32_t y0 = raster_xf_y(xf, rec->by0 * PX8_ONE), y1 = raster_xf_y(xf, rec->by1 * PX8_ONE);
+        if (x0 < -PX8_MAX || y0 < -PX8_MAX || x1 > PX8_MAX || y1 > PX8_MAX) return false;
+        if (!raster_band_intersects(r, px_floor(x0) - pad, px_floor(y0) - pad, px_ceil(x1) + pad, px_ceil(y1) + pad)) return false;
+        if (fill) raster_fill_poly_xf(r, v, rec->count, FILL_NONZERO, xf, pt->fill_idx, pt->fill_alpha);
+        if (stroke) raster_stroke_poly_xf(r, v, rec->count, w8, true, xf, pt->stroke_idx, pt->stroke_alpha);
+        return true;
+    }
+    if (rec->kind == GEOM_CIRCLE) {
+        const int32_t *c = geom_rec_circle(rec);
+        int32_t cx = c[0], cy = c[1], rr = c[2];
+        if (!xf) {
+            if (!raster_band_intersects(r, rec->bx0 - pad, rec->by0 - pad, rec->bx1 + pad, rec->by1 + pad)) return false;
+        } else {
+            cx = raster_xf_x(xf, cx); cy = raster_xf_y(xf, cy); rr = raster_xf_len(xf, rr);
+            if (cx - rr < -PX8_MAX || cy - rr < -PX8_MAX || cx + rr > PX8_MAX || cy + rr > PX8_MAX) return false;
+            if (!raster_band_intersects(r, px_floor(cx - rr) - pad, px_floor(cy - rr) - pad, px_ceil(cx + rr) + pad, px_ceil(cy + rr) + pad)) return false;
+        }
+        if (fill) raster_fill_circle(r, cx, cy, rr, pt->fill_idx, pt->fill_alpha);
+        if (stroke) raster_stroke_circle(r, cx, cy, rr, w8, pt->stroke_idx, pt->stroke_alpha);
+        return true;
+    }
+    return false;
+}
+
 // Draws one op into the current band. Returns true if it drew (or set clip), false if culled.
 static bool draw_op(const frame_t *f, const geom_store_t *geom, raster_t *r, const op_t *op) {
     switch (op->kind) {
@@ -882,27 +990,31 @@ static bool draw_op(const frame_t *f, const geom_store_t *geom, raster_t *r, con
         return true;
     }
     case OP_USE: {
-        if (!geom || op->v[1] < 0 || op->v[1] >= (int16_t)f->npaints) return false;
-        const paint_t *pt = &f->paints[op->v[1]];
-        bool fill = pt->fill_alpha != 0, stroke = pt->stroke_alpha != 0 && pt->width8 > 0;
-        if (!fill && !stroke) return false;
-        const geom_rec_t *rec = geom_store_get(geom, (uint16_t)op->v[0]);
+        const geom_rec_t *rec = geom ? geom_store_get(geom, (uint16_t)op->v[0]) : NULL;
         if (!rec) return false;
-        int32_t pad = stroke ? (pt->width8 + PX8_ONE - 1) / PX8_ONE / 2 + 1 : 0;
-        if (!raster_band_intersects(r, rec->bx0 - pad, rec->by0 - pad, rec->bx1 + pad, rec->by1 + pad)) return false;
-        if (rec->kind == GEOM_POLY) {
-            const int16_t *v = geom_rec_verts(rec);
-            if (rec->count < 2) return false;
-            if (fill) raster_fill_poly(r, v, rec->count, FILL_NONZERO, pt->fill_idx, pt->fill_alpha);
-            if (stroke) raster_stroke_poly(r, v, rec->count, pt->width8, true, false, pt->stroke_idx, pt->stroke_alpha);
-        } else if (rec->kind == GEOM_CIRCLE) {
-            const int32_t *c = geom_rec_circle(rec);
-            if (fill) raster_fill_circle(r, c[0], c[1], c[2], pt->fill_idx, pt->fill_alpha);
-            if (stroke) raster_stroke_circle(r, c[0], c[1], c[2], pt->width8, pt->stroke_idx, pt->stroke_alpha);
-        } else {
-            return false;
+        raster_xf_t xf;
+        if (op->aux) {
+            xf.s_q10 = (op->v[4] * 1024 + 500) / 1000;
+            xf.ox8 = f->ox8; xf.oy8 = f->oy8;
+            xf.tx8 = op->v[2]; xf.ty8 = op->v[3];
         }
-        return true;
+        if (rec->kind != GEOM_GROUP) {
+            if (op->v[1] < 0 || op->v[1] >= (int16_t)f->npaints) return false;
+            return draw_geom(r, rec, &f->paints[op->v[1]], op->aux ? &xf : NULL);
+        }
+        // A group draws its members in order with their own paints (the op's paint is unused).
+        // Each member is culled against the band by its own box, which rejects every band the
+        // union of the members' boxes would and costs no extra pass over them.
+        const uint16_t *m = geom_rec_members(rec);
+        bool drew = false;
+        for (uint32_t i = 0; i < rec->count; i++) {
+            uint16_t mid = m[i * 2], mpaint = m[i * 2 + 1];
+            if (mpaint >= f->npaints) continue;
+            const geom_rec_t *mr = geom_store_get(geom, mid);
+            if (!mr || mr->kind == GEOM_GROUP) continue;
+            if (draw_geom(r, mr, &f->paints[mpaint], op->aux ? &xf : NULL)) drew = true;
+        }
+        return drew;
     }
     default:
         return false;

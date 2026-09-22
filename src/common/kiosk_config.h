@@ -3,7 +3,8 @@
 #pragma once
 #include <stdint.h>
 
-#define KIOSK_FW_VERSION "0.2.0"   // 0.2.0: frames may declare their canvas (w/h), e.g. 1920×1080
+#define KIOSK_FW_VERSION "0.3.0"   // 0.3.0: placed 'u' ops (["u", id, paint, x, y, s]) and group defs
+                                   // 0.2.0: frames may declare their canvas (w/h), e.g. 1920×1080
 #ifndef KIOSK_MODEL
 #define KIOSK_MODEL "pico-w" // CMake sets it from PICO_BOARD (pico-w, pico2-w); this covers host builds
 #endif

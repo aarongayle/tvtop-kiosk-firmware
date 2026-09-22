@@ -18,7 +18,8 @@
 
 // Flash header (also the on-disk layout the host test checks). 'KGEO' as little-endian bytes.
 #define GEOM_HDR_MAGIC 0x4F45474Bu
-#define GEOM_HDR_VERSION 3u   // 3: header carries the output resolution the set was decoded for
+#define GEOM_HDR_VERSION 4u   // 3: header carries the output resolution the set was decoded for
+                              // 4: GROUP records (a set cached by older firmware may have dropped its groups)
 #define GEOM_FLASH_HDR_BYTES 8192u
 #define GEOM_FLASH_PAGE 256u
 #define GEOM_FLASH_BLOCK 65536u

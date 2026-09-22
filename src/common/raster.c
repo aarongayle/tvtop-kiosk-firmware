@@ -276,6 +276,27 @@ static void walk_stream(raster_t *r, const walk_t *w, const int16_t *verts, uint
     if (nv >= 2) walk_edge(r, w, px, py, sx, sy);
 }
 
+// walk_stream with each vertex mapped through a placement as it is read. A separate loop so the
+// stream walk of unplaced geometry stays exactly as it was.
+static void walk_stream_xf(raster_t *r, const walk_t *w, const int16_t *verts, uint32_t count, const raster_xf_t *xf) {
+    int32_t sx = 0, sy = 0, px = 0, py = 0;
+    uint32_t nv = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        int32_t x = verts[i * 2];
+        if (x == GEOM_BREAK) {
+            if (nv >= 2) walk_edge(r, w, px, py, sx, sy);
+            nv = 0;
+            continue;
+        }
+        x = clamp32(raster_xf_x(xf, x), -PX8_MAX, PX8_MAX);
+        int32_t y = clamp32(raster_xf_y(xf, verts[i * 2 + 1]), -PX8_MAX, PX8_MAX);
+        if (nv == 0) { sx = x; sy = y; }
+        else walk_edge(r, w, px, py, x, y);
+        px = x; py = y; nv++;
+    }
+    if (nv >= 2) walk_edge(r, w, px, py, sx, sy);
+}
+
 static void sort_crossings(int16_t *a, int32_t n) {
     for (int32_t i = 1; i < n; i++) {
         int16_t v = a[i];
@@ -305,12 +326,13 @@ static bool walk_begin(raster_t *r, walk_t *w, uint8_t ss, uint8_t *counts, int3
 
 static inline int32_t cross_x(int16_t c) { int32_t d = c & 1; return (c - d) / 2; }
 
-void raster_fill_poly(raster_t *r, const int16_t *verts, uint32_t count, uint8_t rule, uint8_t idx, uint8_t alpha) {
+static void fill_poly(raster_t *r, const int16_t *verts, uint32_t count, uint8_t rule, const raster_xf_t *xf, uint8_t idx, uint8_t alpha) {
     if (alpha == 0 || count < 3) return;
     walk_t w;
     int32_t ry0, ry1;
     if (!walk_begin(r, &w, 1, r->ncross, &ry0, &ry1)) return;
-    walk_stream(r, &w, verts, count);
+    if (xf) walk_stream_xf(r, &w, verts, count, xf);
+    else walk_stream(r, &w, verts, count);
     for (int32_t y = ry0; y < ry1; y++) {
         int32_t slot = y - ry0, n = w.n[slot];
         if (n < 2) continue;
@@ -327,6 +349,14 @@ void raster_fill_poly(raster_t *r, const int16_t *verts, uint32_t count, uint8_t
             inside = now;
         }
     }
+}
+
+void raster_fill_poly(raster_t *r, const int16_t *verts, uint32_t count, uint8_t rule, uint8_t idx, uint8_t alpha) {
+    fill_poly(r, verts, count, rule, NULL, idx, alpha);
+}
+
+void raster_fill_poly_xf(raster_t *r, const int16_t *verts, uint32_t count, uint8_t rule, const raster_xf_t *xf, uint8_t idx, uint8_t alpha) {
+    fill_poly(r, verts, count, rule, xf, idx, alpha);
 }
 
 // Coverage 0..255 → the four levels the blend cache is sized for.
@@ -438,7 +468,7 @@ void raster_line(raster_t *r, int32_t x0_8, int32_t y0_8, int32_t x1_8, int32_t 
     fill_segment(r, x0_8, y0_8, x1_8, y1_8, w8 / 2, idx, alpha);
 }
 
-void raster_stroke_poly(raster_t *r, const int16_t *verts, uint32_t count, int32_t w8, bool closed, bool round_joins, uint8_t idx, uint8_t alpha) {
+static void stroke_poly(raster_t *r, const int16_t *verts, uint32_t count, int32_t w8, bool closed, bool round_joins, const raster_xf_t *xf, uint8_t idx, uint8_t alpha) {
     if (alpha == 0 || w8 <= 0) return;
     if (w8 < PX8_ONE) w8 = PX8_ONE;
     int32_t hw = w8 / 2;
@@ -448,6 +478,9 @@ void raster_stroke_poly(raster_t *r, const int16_t *verts, uint32_t count, int32
         bool end = i == count;
         int32_t x = 0, y = 0;
         if (!end) { x = verts[i * 2]; y = verts[i * 2 + 1]; }
+        // Per-vertex mapping costs a predictable branch next to a segment fill (a square root and
+        // a quad) per vertex, so this loop is shared rather than duplicated like walk_stream.
+        if (xf && !end && x != GEOM_BREAK) { x = clamp32(raster_xf_x(xf, x), -PX8_MAX, PX8_MAX); y = clamp32(raster_xf_y(xf, y), -PX8_MAX, PX8_MAX); }
         if (end || x == GEOM_BREAK) {
             if (nv >= 2 && closed) {
                 fill_segment(r, px, py, sx, sy, hw, idx, alpha);
@@ -474,6 +507,14 @@ void raster_stroke_poly(raster_t *r, const int16_t *verts, uint32_t count, int32
         if (round_joins) raster_fill_circle(r, x, y, hw, idx, alpha);
         px = x; py = y; nv++;
     }
+}
+
+void raster_stroke_poly(raster_t *r, const int16_t *verts, uint32_t count, int32_t w8, bool closed, bool round_joins, uint8_t idx, uint8_t alpha) {
+    stroke_poly(r, verts, count, w8, closed, round_joins, NULL, idx, alpha);
+}
+
+void raster_stroke_poly_xf(raster_t *r, const int16_t *verts, uint32_t count, int32_t w8, bool closed, const raster_xf_t *xf, uint8_t idx, uint8_t alpha) {
+    stroke_poly(r, verts, count, w8, closed, false, xf, idx, alpha);
 }
 
 // ---- bitmaps and glyphs ----

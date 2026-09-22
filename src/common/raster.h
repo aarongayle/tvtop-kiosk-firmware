@@ -44,6 +44,20 @@ void raster_fill_poly(raster_t *r, const int16_t *verts, uint32_t count, uint8_t
 // Anti-aliased variant for glyphs/icons: exact horizontal coverage, `ss` sub-rows per pixel row
 // (1..4). Coverage is quantised through palette_blend.
 void raster_fill_poly_aa(raster_t *r, const int16_t *verts, uint32_t count, uint8_t rule, uint8_t ss, uint8_t idx, uint8_t alpha);
+// Placed geometry: a uniform scale about the device-space canvas origin (ox8, oy8), then a move to
+// (tx8, ty8). p' = t + (p - o) * s_q10 / 1024, px8. s_q10 is the wire scale in 1/1024 so the
+// product stays in 32 bits (see RASTER_XF_S_MAX); 1000 thousandths is exactly 1024.
+typedef struct { int32_t s_q10, ox8, oy8, tx8, ty8; } raster_xf_t;
+#define RASTER_XF_S_MAX 32767   // largest wire scale (thousandths) a placed op may carry
+_Static_assert((int64_t)(PX8_MAX + OUT_MAX_W * PX8_ONE) * ((RASTER_XF_S_MAX * 1024 + 500) / 1000) + 512 <= INT32_MAX,
+               "placed transform must not overflow int32");
+static inline int32_t raster_xf_x(const raster_xf_t *t, int32_t x8) { return t->tx8 + (((x8 - t->ox8) * t->s_q10 + 512) >> 10); }
+static inline int32_t raster_xf_y(const raster_xf_t *t, int32_t y8) { return t->ty8 + (((y8 - t->oy8) * t->s_q10 + 512) >> 10); }
+static inline int32_t raster_xf_len(const raster_xf_t *t, int32_t l8) { return (l8 * t->s_q10 + 512) >> 10; }
+// raster_fill_poly / raster_stroke_poly with every vertex mapped through `xf` as it is read (the
+// stream itself is untouched, so it can stay in flash). Mapped vertices are clamped to ±PX8_MAX.
+void raster_fill_poly_xf(raster_t *r, const int16_t *verts, uint32_t count, uint8_t rule, const raster_xf_t *xf, uint8_t idx, uint8_t alpha);
+void raster_stroke_poly_xf(raster_t *r, const int16_t *verts, uint32_t count, int32_t w8, bool closed, const raster_xf_t *xf, uint8_t idx, uint8_t alpha);
 // Strokes each contour of the stream with width w8. Segments are drawn as quads; joins/caps are
 // round discs when `round_joins` (used for icons), otherwise plain quads (map borders). Contours
 // are closed when `closed`.
