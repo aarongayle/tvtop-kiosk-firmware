@@ -132,7 +132,7 @@ static void test_blank_and_write(void) {
     CHECK(geom_store_is_open(g) && geom_store_count(g) == 600 && strcmp(geom_store_id(g), "board-1") == 0);
     // Header on "disk".
     const geom_flash_hdr_t *h = hdr();
-    CHECK(h->magic == 0x4F45474Bu && memcmp(&h->magic, "KGEO", 4) == 0 && h->version == 3);
+    CHECK(h->magic == 0x4F45474Bu && memcmp(&h->magic, "KGEO", 4) == 0 && h->version == 4);
     CHECK(strcmp(h->static_id, "board-1") == 0 && h->ndefs == 600);
     CHECK(h->data_len == used - GEOM_FLASH_HDR_BYTES);
     CHECK(h->data_crc32 == crc32_update(0, flash_img + REGION + GEOM_FLASH_HDR_BYTES, h->data_len));
@@ -181,7 +181,7 @@ static void test_corruption(void) {
     CHECK(geom_store_open(geom_flash_get(), "board-1"));
     // Wrong version / magic / data_len out of range / unterminated id.
     geom_flash_hdr_t *h = (geom_flash_hdr_t *)(void *)(flash_img + REGION);
-    uint32_t v = h->version; h->version = 4; geom_flash_test_reboot(); CHECK(!geom_store_open(geom_flash_get(), "board-1")); h->version = v;
+    uint32_t v = h->version; h->version = 3; geom_flash_test_reboot(); CHECK(!geom_store_open(geom_flash_get(), "board-1")); h->version = v;
     uint32_t m = h->magic; h->magic = 0; geom_flash_test_reboot(); CHECK(!geom_store_open(geom_flash_get(), "board-1")); h->magic = m;
     uint32_t dl = h->data_len; h->data_len = REGION_SIZE; geom_flash_test_reboot(); CHECK(!geom_store_open(geom_flash_get(), "board-1")); h->data_len = dl;
     uint32_t nd = h->ndefs; h->ndefs = KIOSK_MAX_DEFS + 1; geom_flash_test_reboot(); CHECK(!geom_store_open(geom_flash_get(), "board-1")); h->ndefs = nd;
@@ -283,12 +283,30 @@ static void test_region_full(void) {
     CHECK((geom_store_get(g, 300) != NULL) == tail_fits);
 }
 
+// A group record survives the flash round trip and a reboot like any other.
+static void test_group_flash(void) {
+    flash_reset_chip();
+    geom_flash_test_reboot();
+    geom_store_t *g = geom_flash_get();
+    const uint16_t m[6] = { 7, 0, 9, 2, 8, 1 };
+    CHECK(geom_store_begin(g, "groups", scratch, sizeof scratch));
+    CHECK(geom_store_add_group(g, 3, m, 3));
+    CHECK(geom_store_add_circle(g, 7, 80, 80, 40));
+    CHECK(geom_store_commit(g));
+    geom_flash_test_reboot();
+    g = geom_flash_get();
+    CHECK(geom_store_open(g, "groups") && geom_store_count(g) == 2);
+    const geom_rec_t *r = geom_store_get(g, 3);
+    CHECK(r && r->kind == GEOM_GROUP && r->count == 3 && memcmp(geom_rec_members(r), m, sizeof m) == 0);
+}
+
 int main(void) {
     test_blank_and_write();
     test_reboot_open();
     test_corruption();
     test_abort_and_crash();
     test_region_full();
+    test_group_flash();
     CHECK(violations == 0);
     if (failures) { printf("test_geom_flash: %d failure(s)\n", failures); return 1; }
     printf("test_geom_flash: all passed\n");

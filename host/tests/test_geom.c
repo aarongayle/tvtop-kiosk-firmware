@@ -1,5 +1,5 @@
 // geom (RAM backend) tests: 1500 mixed defs round trip, bboxes, clamping, oversize records,
-// out-of-range ids, abort/commit/open semantics, capacity exhaustion, misuse.
+// out-of-range ids, abort/commit/open semantics, capacity exhaustion, misuse, group records.
 #include "geom.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -270,10 +270,52 @@ static void test_oversize_and_misuse(void) {
     free(scratch);
 }
 
+// Group records: member pairs round trip in order, the cap and misuse are refused, a group can be
+// written before its members, and a corrupt member count is rejected on read.
+static void test_groups(void) {
+    geom_store_t *g = geom_ram_create(1 << 16);
+    uint8_t *scratch = scratch_alloc();
+    uint16_t m[2 * (GEOM_GROUP_MAX + 1)];
+    for (int i = 0; i < GEOM_GROUP_MAX + 1; i++) { m[i * 2] = (uint16_t)(100 + i); m[i * 2 + 1] = (uint16_t)(i % 5); }
+    CHECK(!geom_store_add_group(g, 1, m, 3));   // not writing
+    CHECK(geom_store_begin(g, "groups", scratch, GEOM_SCRATCH_MIN));
+    CHECK(geom_store_add_group(g, 1, m, 3));    // before its members exist
+    CHECK(geom_store_add_group(g, 2, m, GEOM_GROUP_MAX));
+    CHECK(!geom_store_add_group(g, 3, m, GEOM_GROUP_MAX + 1));
+    CHECK(!geom_store_add_group(g, KIOSK_MAX_DEFS, m, 1));
+    CHECK(geom_store_add_group(g, 4, NULL, 0));   // empty is legal and draws nothing
+    CHECK(geom_store_begin_poly(g, 5));
+    CHECK(!geom_store_add_group(g, 6, m, 1));     // while a poly is open
+    CHECK(geom_store_add_vertex(g, 0, 0, true));
+    CHECK(geom_store_end_poly(g));
+    CHECK(geom_store_add_circle(g, 100, 8, 8, 8));
+    CHECK(geom_store_commit(g));
+    CHECK(geom_store_count(g) == 5 && geom_store_dropped(g) == 0);
+    const geom_rec_t *r = geom_store_get(g, 1);
+    CHECK(r && r->kind == GEOM_GROUP && r->count == 3 && r->bx0 == 0 && r->bx1 == 0);
+    if (r) for (int i = 0; i < 3; i++) CHECK(geom_rec_members(r)[i * 2] == 100 + i && geom_rec_members(r)[i * 2 + 1] == i % 5);
+    r = geom_store_get(g, 2);
+    CHECK(r && r->count == GEOM_GROUP_MAX && geom_rec_members(r)[(GEOM_GROUP_MAX - 1) * 2] == 100 + GEOM_GROUP_MAX - 1);
+    CHECK(geom_store_get(g, 3) == NULL && geom_store_get(g, 6) == NULL);
+    r = geom_store_get(g, 4);
+    CHECK(r && r->kind == GEOM_GROUP && r->count == 0);
+    CHECK(geom_store_get(g, 100) && geom_store_get(g, 100)->kind == GEOM_CIRCLE);
+    // A trailer claiming more members than the cap (bit rot) is refused rather than read.
+    r = geom_store_get(g, 2);
+    if (r) {
+        ((geom_rec_t *)(uintptr_t)r)->count = GEOM_GROUP_MAX + 1;
+        CHECK(geom_store_get(g, 2) == NULL);
+        ((geom_rec_t *)(uintptr_t)r)->count = GEOM_GROUP_MAX;
+        CHECK(geom_store_get(g, 2) != NULL);
+    }
+    free(scratch);
+}
+
 int main(void) {
     test_round_trip();
     test_clamp_and_bbox();
     test_oversize_and_misuse();
+    test_groups();
     if (failures) { printf("test_geom: %d failure(s)\n", failures); return 1; }
     printf("test_geom: all passed\n");
     return 0;

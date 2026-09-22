@@ -70,6 +70,142 @@ static void render_all(const geom_store_t *geom) {
     for (int y = 0; y < g_frame.h; y++) CHECK_MSG(g_seen[y] == 1, "line %d delivered %u times", y, g_seen[y]);
 }
 
+// ---- placed 'u' ops and group defs ------------------------------------------------------------
+
+static uint8_t g_img2[OUT_MAX_W * OUT_MAX_H];
+
+// Decodes a frame written with ' for " (readability) at w×h, renders it into g_img, and returns
+// the decode status. `st` (optional) gets the render stats.
+static frame_status_t run(geom_store_t *geom, const char *text, uint16_t w, uint16_t h, render_stats_t *st) {
+    static char buf[8192];
+    size_t n = strlen(text);
+    if (n >= sizeof buf) return FD_ERR_JSON;
+    for (size_t i = 0; i <= n; i++) buf[i] = text[i] == '\'' ? '"' : text[i];
+    frame_status_t fs = decode_chunked(buf, n, geom, 3, w, h);
+    if (fs != FD_OK) return fs;
+    raster_t r;
+    raster_init(&r, g_scratch, g_rscratch, w, h, &g_pal);
+    memset(g_img, 0, sizeof g_img);
+    render_stats_t rs = {0};
+    frame_render(&g_frame, &g_pal, geom, &r, NULL, 0, sink, NULL, &rs);
+    if (st) *st = rs;
+    return fs;
+}
+
+static int img_diff(uint16_t w, uint16_t h) {
+    int n = 0;
+    for (int y = 0; y < h; y++) n += memcmp(g_img + (size_t)y * OUT_MAX_W, g_img2 + (size_t)y * OUT_MAX_W, w) != 0;
+    return n;
+}
+
+static uint32_t px(int x, int y) { return palette_rgb(&g_pal, g_img[(size_t)y * OUT_MAX_W + x]); }
+
+#define RED palette_quantize_rgb(0xff0000)
+#define BLUE palette_quantize_rgb(0x0000ff)
+#define WHITE palette_quantize_rgb(0xffffff)
+
+// Every static set below is new (its own id), so each frame carries its defs.
+#define DEFS_AT_ORIGIN "'0':['path','M0 0 L30 0 L30 20 Z M4 4 L12 4 L12 10 L4 10 Z',0,0,1,1],'1':['circle',10,10,8]"
+
+static void test_placed(geom_store_t *geom) {
+    // Both forms parse; the placed one keeps x, y (device px8) and s.
+    CHECK(run(geom, "{'v':3,'bg':'#ffffff','static':{'id':'p1','defs':{" DEFS_AT_ORIGIN "},'paints':[['#ff0000',null,0]]},"
+                    "'ops':[['u','0',0],['u','0',0,100,50,1500],['u','0',0,'x',5,6],['u','0',0,100,50],['u','0',0,1,2,true],"
+                    "['u','0',0,100,50,0],['u','0',0,100,50,-5],['u','0',0,100,50,32768],['u','0',0,100.5,50.25,32767]]}", 1280, 720, NULL) == FD_OK);
+    CHECK(g_frame.nops == 6 && g_frame.stats_dropped_ops == 3);   // s = 0, -5 and 32768 dropped
+    CHECK(g_frame.ops[0].aux == 0 && g_frame.ops[0].v[0] == 0 && g_frame.ops[0].v[1] == 0);
+    CHECK(g_frame.ops[1].aux == 1 && g_frame.ops[1].v[2] == 800 && g_frame.ops[1].v[3] == 400 && g_frame.ops[1].v[4] == 1500);
+    CHECK(g_frame.ops[2].aux == 0 && g_frame.ops[3].aux == 0);   // a non-number, or only five elements: the plain form
+    CHECK(g_frame.ops[5].aux == 1 && g_frame.ops[5].v[2] == 804 && g_frame.ops[5].v[3] == 402 && g_frame.ops[5].v[4] == 32767);
+
+    // A placed draw matches the same shape defined at its placed position and size: at 1920×1080
+    // (k = 1.5, no offset), at 640×480 (k = 0.5 and a 60 px letterbox, which must not be scaled
+    // along with the vertices) and at 1280×720. Strokes scale with s, so the "defined" frame uses a
+    // paint twice as wide.
+    static const uint16_t modes[3][2] = { { 1920, 1080 }, { 640, 480 }, { 1280, 720 } };
+    for (int m = 0; m < 3; m++) {
+        uint16_t w = modes[m][0], h = modes[m][1];
+        CHECK(run(geom, "{'v':3,'bg':'#ffffff','static':{'id':'p2','defs':{" DEFS_AT_ORIGIN "},"
+                        "'paints':[['#ff0000','#0000ff',2],['#0000ff',null,0]]},"
+                        "'ops':[['u','0',0,100,50,2000],['u','1',1,400,300,2000],['u','1',0,700,300,1500]]}", w, h, NULL) == FD_OK);
+        memcpy(g_img2, g_img, sizeof g_img);
+        CHECK(run(geom, "{'v':3,'bg':'#ffffff','static':{'id':'p3','defs':{"
+                        "'0':['path','M0 0 L30 0 L30 20 Z M4 4 L12 4 L12 10 L4 10 Z',100,50,2,2],'1':['circle',420,320,16],'2':['circle',715,315,12]},"
+                        "'paints':[['#ff0000','#0000ff',4],['#0000ff',null,0],['#ff0000','#0000ff',3]]},"
+                        "'ops':[['u','0',0],['u','1',1],['u','2',2]]}", w, h, NULL) == FD_OK);
+        CHECK_MSG(img_diff(w, h) == 0, "%ux%u: %d rows differ", w, h, img_diff(w, h));
+    }
+    // Where it lands, at 640×480: canvas 100..160 × 50..90 is device 50..80 × 60 + (25..45).
+    CHECK(run(geom, "{'v':3,'bg':'#ffffff','static':{'id':'p4','defs':{'0':['poly','0,0 30,0 30,20 0,20',0,0,1,1]},'paints':[['#ff0000',null,0]]},"
+                    "'ops':[['u','0',0,100,50,2000]]}", 640, 480, NULL) == FD_OK);
+    CHECK(g_frame.oy8 == 60 * PX8_ONE && g_frame.ox8 == 0);
+    CHECK(px(65, 84) == WHITE && px(65, 85) == RED && px(65, 104) == RED && px(65, 105) == WHITE);
+    CHECK(px(49, 90) == WHITE && px(50, 90) == RED && px(79, 90) == RED && px(80, 90) == WHITE);
+
+    // Band rejection uses the placed box: the shape at y 600..640 (1280×720, 16-line bands) is
+    // drawn in exactly the three bands it touches, 592..640.
+    render_stats_t st;
+    CHECK(run(geom, "{'v':3,'bg':'#ffffff','static':{'id':'p5','defs':{" DEFS_AT_ORIGIN "},'paints':[['#ff0000',null,0]]},"
+                    "'ops':[['u','0',0,10,600,2000]]}", 1280, 720, &st) == FD_OK);
+    CHECK_MSG(st.ops_drawn == 3 && st.ops_skipped == 720 / 16 - 3, "drawn %u skipped %u", st.ops_drawn, st.ops_skipped);
+    CHECK(px(20, 601) == RED && px(20, 599) == WHITE);
+    // A placement whose box leaves the int16 px8 range is dropped at draw time, not clamped.
+    CHECK(run(geom, "{'v':3,'bg':'#ffffff','static':{'id':'p6','defs':{'0':['poly','0,0 200,0 200,100 0,100',0,0,1,1]},'paints':[['#ff0000',null,0]]},"
+                    "'ops':[['u','0',0,0,0,32767],['u','0',0,200,0,20000]]}", 1280, 720, &st) == FD_OK);
+    CHECK(g_frame.nops == 2 && st.ops_drawn == 0 && px(10, 10) == WHITE);   // 6553 px wide; 4000 px wide from x = 200 ends past 4095
+    CHECK(run(geom, "{'v':3,'bg':'#ffffff','static':{'id':'p7','defs':{'0':['poly','0,0 200,0 200,100 0,100',0,0,1,1]},'paints':[['#ff0000',null,0]]},"
+                    "'ops':[['u','0',0,0,0,20000]]}", 1280, 720, &st) == FD_OK);
+    CHECK(st.ops_drawn == 720 / 16 && px(10, 10) == RED && px(1279, 719) == RED);   // 4000 x 2000 px still fits
+}
+
+static void test_groups(geom_store_t *geom) {
+    // Group "0" is defined before its members. Members: 1 red rect, 2 blue circle over its right
+    // half, then ones that must be skipped — an absent id, a group, itself, a paint the frame does
+    // not have — then 2 again. The malformed members after that are dropped while decoding.
+    const char *defs = "'0':['group',[['1',0],['2',1],['zz',0],['3',0],['0',0],['1',99],['2',1],['x!',0],[5],'no',[['1'],0],{'a':1}]],"
+                       "'1':['poly','0,0 40,0 40,20 0,20',0,0,1,1],'2':['circle',40,10,10],"
+                       "'3':['group',[['1',1]]],'4':['group',[['2',1],['1',0]]]";
+    char frame[2048];
+    snprintf(frame, sizeof frame, "{'v':3,'bg':'#ffffff','static':{'id':'g1','defs':{%s},'paints':[['#ff0000',null,0],['#0000ff',null,0]]},"
+                                  "'ops':[['u','0',0],['u','0',5,200,100,1500],['u','4',0,0,200,1000]]}", defs);
+    CHECK(run(geom, frame, 1280, 720, NULL) == FD_OK);
+    CHECK(g_frame.nops == 3 && g_frame.stats_dropped_defs == 0 && geom_store_count(geom) == 5);
+    const geom_rec_t *g0 = geom_store_get(geom, 0);
+    CHECK(g0 && g0->kind == GEOM_GROUP && g0->count == 7);
+    if (g0) CHECK(geom_rec_members(g0)[0] == 1 && geom_rec_members(g0)[1] == 0 && geom_rec_members(g0)[2] == 2 && geom_rec_members(g0)[3] == 1
+                  && geom_rec_members(g0)[4] == 35 * 36 + 35 && geom_rec_members(g0)[11] == 99);
+    // Member order: in "0" the circle is drawn over the rect, in "4" under it. Skipped members
+    // (the group "3" would paint the rect blue) leave no trace.
+    CHECK(px(10, 10) == RED && px(35, 10) == BLUE && px(45, 10) == BLUE);
+    CHECK(px(10, 210) == RED && px(35, 210) == RED && px(45, 210) == BLUE);
+    memcpy(g_img2, g_img, sizeof g_img);
+    // The same picture from one 'u' op per surviving member.
+    snprintf(frame, sizeof frame, "{'v':3,'bg':'#ffffff','static':{'id':'g2','defs':{%s},'paints':[['#ff0000',null,0],['#0000ff',null,0]]},"
+                                  "'ops':[['u','1',0],['u','2',1],['u','2',1],['u','1',0,200,100,1500],['u','2',1,200,100,1500],['u','2',1,200,100,1500],"
+                                  "['u','2',1,0,200,1000],['u','1',0,0,200,1000]]}", defs);
+    CHECK(run(geom, frame, 1280, 720, NULL) == FD_OK);
+    CHECK_MSG(img_diff(1280, 720) == 0, "group vs members: %d rows differ", img_diff(1280, 720));
+    // Drawn directly, "3" is an ordinary group; at 1080p placed and plain groups match their members too.
+    snprintf(frame, sizeof frame, "{'v':3,'bg':'#ffffff','static':{'id':'g3','defs':{%s},'paints':[['#ff0000',null,0],['#0000ff',null,0]]},"
+                                  "'ops':[['u','3',0],['u','0',0,600,400,3000]]}", defs);
+    CHECK(run(geom, frame, 1920, 1080, NULL) == FD_OK);
+    CHECK(px(15, 15) == BLUE);
+    memcpy(g_img2, g_img, sizeof g_img);
+    snprintf(frame, sizeof frame, "{'v':3,'bg':'#ffffff','static':{'id':'g4','defs':{%s},'paints':[['#ff0000',null,0],['#0000ff',null,0]]},"
+                                  "'ops':[['u','1',1],['u','1',0,600,400,3000],['u','2',1,600,400,3000],['u','2',1,600,400,3000]]}", defs);
+    CHECK(run(geom, frame, 1920, 1080, NULL) == FD_OK);
+    CHECK_MSG(img_diff(1920, 1080) == 0, "1080p group vs members: %d rows differ", img_diff(1920, 1080));
+
+    // Members past GEOM_GROUP_MAX are dropped; the group is kept.
+    char big[2048];
+    int n = snprintf(big, sizeof big, "{'v':3,'bg':'#ffffff','static':{'id':'g5','defs':{'1':['circle',10,10,5],'0':['group',[");
+    for (int i = 0; i < GEOM_GROUP_MAX + 8; i++) n += snprintf(big + n, sizeof big - (size_t)n, "%s['1',%d]", i ? "," : "", i % 2);
+    snprintf(big + n, sizeof big - (size_t)n, "]]},'paints':[['#ff0000',null,0],['#0000ff',null,0]]},'ops':[['u','0',0]]}");
+    CHECK(run(geom, big, 1280, 720, NULL) == FD_OK);
+    g0 = geom_store_get(geom, 0);
+    CHECK(g0 && g0->count == GEOM_GROUP_MAX && px(10, 10) == BLUE);   // member 31 (paint 1) is the last drawn
+}
+
 static int fixture_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
 int main(void) {
@@ -89,6 +225,9 @@ int main(void) {
         CHECK(decode_chunked(old, sizeof old - 1, geom, 5, 1920, 1080) == FD_OK && g_frame.nops == 1);
         CHECK(g_frame.ops[0].v[0] == 450 * PX8_ONE && g_frame.ops[0].v[2] == 135 * PX8_ONE);
     }
+
+    test_placed(geom);
+    test_groups(geom);
 
     DIR *d = opendir("test/fixtures");
     CHECK(d != NULL);

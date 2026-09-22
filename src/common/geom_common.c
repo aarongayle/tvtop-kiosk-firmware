@@ -66,6 +66,7 @@ const geom_rec_t *geom_store_get(const geom_store_t *g, uint16_t id) {
     uint32_t room = (off - g->rd_data_begin) / 4u;   // int16 pairs available before the trailer
     if (r->kind == GEOM_POLY) { if (r->count > room) return NULL; }
     else if (r->kind == GEOM_CIRCLE) { if (r->count != 3 || room < 3) return NULL; }
+    else if (r->kind == GEOM_GROUP) { if (r->count > GEOM_GROUP_MAX || r->count > room) return NULL; }
     else return NULL;
     if (r->id != id) return NULL;
     return r;
@@ -127,6 +128,15 @@ bool geom_store_add_circle(geom_store_t *g, uint16_t id, int32_t cx8, int32_t cy
     rec.by1 = clamp_px64(((int64_t)cy8 + r8 + PX8_ONE - 1) >> PX8_SHIFT);
     int32_t c[3] = { cx8, cy8, r8 };
     if (!put(g, c, sizeof c)) { g->stats_dropped++; return false; }
+    return finish_record(g, &rec);
+}
+
+bool geom_store_add_group(geom_store_t *g, uint16_t id, const uint16_t *members, uint32_t n) {
+    if (!g->writing || g->rec_active || id >= KIOSK_MAX_DEFS || n > GEOM_GROUP_MAX || (n && !members)) return false;
+    geom_rec_t rec;
+    memset(&rec, 0, sizeof rec);
+    rec.id = id; rec.kind = GEOM_GROUP; rec.count = n;
+    if (n && !put(g, members, n * 4)) { g->stats_dropped++; return false; }
     return finish_record(g, &rec);
 }
 

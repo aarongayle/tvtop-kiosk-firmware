@@ -19,7 +19,8 @@ enum { OP_RECT = 'r', OP_LINE = 'l', OP_CIRCLE = 'c', OP_TEXT = 't', OP_BITMAP =
 //  bitmap: x, y, size, modules, -        str = arena offset of [u16 len][row bytes]; cidx = colour
 //  icon:   x, y, size                    aux = icon index
 //  clip:   x0, y0, x1, y1 in whole px (exclusive), aux = 1 if clip set, 0 if cleared
-//  use:    v[0] = def id, v[1] = paint index
+//  use:    v[0] = def id, v[1] = paint index; placed (aux = 1): v[2], v[3] = x, y, v[4] = scale in
+//          thousandths (1..RASTER_XF_S_MAX, a plain integer)
 typedef struct { uint8_t kind, aux, cidx, alpha; int16_t v[5]; uint16_t str; } op_t;
 
 typedef struct { uint8_t fill_idx, fill_alpha, stroke_idx, stroke_alpha; int16_t width8; } paint_t;   // alpha 0 = none
@@ -27,6 +28,7 @@ typedef struct { uint8_t fill_idx, fill_alpha, stroke_idx, stroke_alpha; int16_t
 typedef struct {
     uint8_t version;
     uint16_t w, h;               // output size (device px)
+    int32_t ox8, oy8;            // device px8 of the canvas origin (letterbox offset), for placed 'u' ops
     uint8_t bg_idx;
     uint16_t nops;
     op_t ops[KIOSK_MAX_OPS];
