@@ -124,6 +124,21 @@ static void persist_next_url(const char *url, const char *static_id) {
     config_mark_dirty();
 }
 
+// The URL to poll after the screen has shown something other than the current frame: rev=0 so the
+// server answers at once with the frame instead of holding the request open (or answering 304) for
+// the revision already drawn. A URL that names a static set is only usable while that set is open.
+static void resume_url(void) {
+    const char *u = kiosk_config.next_url[0] ? kiosk_config.next_url : cur_url;
+    if (u[0] && (!url_has_static(u) || geom_store_is_open(geom))) {
+        char base[KIOSK_MAX_URL];
+        strip_rev(u, base, sizeof base);
+        snprintf(cur_url, sizeof cur_url, "%s%crev=0", base, strchr(base, '?') ? '&' : '?');
+    } else {
+        config_url(cur_url, sizeof cur_url);
+    }
+    cur_url[sizeof cur_url - 1] = 0;
+}
+
 // ---- rendering -----------------------------------------------------------------------------------
 
 typedef struct { uint32_t bytes; } sink_ctx_t;
@@ -338,7 +353,12 @@ static void frame_on_complete(void *ctx, int err, int status) {
     netcheck_waiting = false;
     netcheck_asked_ms = 0;
     if (watchdog_hw->scratch[0]) watchdog_hw->scratch[0] = 0;   // the network works: recovery budget restored
-    if (overlay_offline) overlay_offline = false;
+    if (overlay_offline) {
+        // Take the badge down now: a 304 draws nothing, and on a quiet screen the next 200 could be
+        // a long way off.
+        overlay_offline = false;
+        if (frame_valid) render_frame_now();
+    }
     if (status == 304) { next_request_ms = now + POLL_FLOOR_MS; return; }
     if (status == 404) {
         // A 404 from a frame URL just means "start again from /config". A 404 from /config itself
@@ -612,9 +632,17 @@ static bool join_poll(void) {
 
 static void netcheck_poll(void) {
     uint32_t now = now_ms();
+    // Polls are working again. The setup AP raised alongside a diagnosis has done its job, unless
+    // someone is on the portal right now.
+    if (fallback_ap && consecutive_failures == 0 && !provision_busy()) {
+        printf("net: polls recovered; taking the setup AP down\n");
+        provision_stop();
+        fallback_ap = false;
+    }
+    // A verdict that never arrives (the modem drops a check that finds its HTTP task busy with a
+    // long poll) must not stop the next one being asked for.
     if (consecutive_failures >= NETCHECK_AFTER_FAILURES && net_wifi_state() == WIFI_UP &&
-        (netcheck_asked_ms == 0 || now - netcheck_asked_ms >= NETCHECK_EVERY_MS) &&
-        !netcheck_waiting) {
+        (netcheck_asked_ms == 0 || now - netcheck_asked_ms >= NETCHECK_EVERY_MS)) {
         netcheck_asked_ms = now;
         netcheck_waiting = true;
         net_wifi_check_start();
@@ -650,6 +678,11 @@ static void netcheck_poll(void) {
     printf("net: %s\n", v == NET_CHECK_CAPTIVE ? "captive portal detected" : "no internet on this network");
     kiosk_show_builtin(BUILTIN_NO_INTERNET, ssid, body);
     frame_valid = false;   // the overlay has nothing to sit on now
+    // The diagnosis is a snapshot, and it is up in place of the frame. When polls start working
+    // again the frame must come back by itself: at the old revision the server would answer 304,
+    // or park the request until something changed, and a quiet screen would keep saying the
+    // network is broken while it plainly is not.
+    resume_url();
 
     // Give them the means as well as the diagnosis: with the setup AP up they can switch to a
     // hotspot without hunting for a laptop.
@@ -667,14 +700,8 @@ static void start_poll_state(void) {
     // drawn before a reboot or reconnect, and in a quiet game the server would hold that request
     // open with nothing new to send, leaving a cleared or connecting screen up until someone moved.
     // rev=0 answers at once with the current frame; the static set id still avoids a map download.
-    if (kiosk_config.next_url[0] && (!url_has_static(kiosk_config.next_url) || geom_store_is_open(geom))) {
-        char base[KIOSK_MAX_URL];
-        strip_rev(kiosk_config.next_url, base, sizeof base);
-        snprintf(cur_url, sizeof cur_url, "%s%crev=0", base, strchr(base, '?') ? '&' : '?');
-    } else {
-        config_url(cur_url, sizeof cur_url);
-    }
-    cur_url[sizeof cur_url - 1] = 0;
+    cur_url[0] = 0;
+    resume_url();
     next_request_ms = now_ms();
     state = KS_POLL;
 }
